@@ -7,6 +7,7 @@ import re
 from abc import ABC
 from collections import OrderedDict
 from contextlib import ExitStack
+from enum import Enum
 from types import SimpleNamespace
 from typing import (
     Any,
@@ -33,7 +34,7 @@ from rich.markup import escape
 from rich.prompt import Prompt
 
 from langroid.agent.chat_document import ChatDocMetaData, ChatDocument
-from langroid.agent.tool_message import ToolMessage
+from langroid.agent.tool_message import ToolMessage, handler_name
 from langroid.agent.xml_tool_message import XMLToolMessage
 from langroid.exceptions import XMLException
 from langroid.language_models.base import (
@@ -72,6 +73,12 @@ console = Console(quiet=settings.quiet)
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+class SearchForTools(Enum):
+    CONTENT = 1  # from message content
+    FUNCTIONS = 2  # from OpenAI function calls
+    TOOLS = 3  # from OpenAI tool calls
 
 
 class AgentConfig(BaseSettings):
@@ -153,6 +160,11 @@ class Agent(ABC):
         self.llm = LanguageModel.create(config.llm)
         self.vecdb = VectorStore.create(config.vecdb) if config.vecdb else None
         self.tool_error = False
+        self.search_for_tools = {
+            SearchForTools.CONTENT.value,
+            SearchForTools.TOOLS.value,
+            SearchForTools.FUNCTIONS.value,
+        }
         if config.parsing is not None and self.config.llm is not None:
             # token_encoding_model is used to obtain the tokenizer,
             # so in case it's an OpenAI model, we ensure that the tokenizer
@@ -458,10 +470,7 @@ class Agent(ABC):
         if tool has handler method explicitly defined - use it,
         otherwise use the tool name as the handler
         """
-        if hasattr(message_class, "_handler"):
-            handler = getattr(message_class, "_handler", tool)
-        else:
-            handler = tool
+        handler = handler_name(message_class, tool)
 
         self.llm_tools_map[tool] = message_class
         if (
@@ -614,6 +623,7 @@ class Agent(ABC):
         oai_tool_id2result: OrderedDict[str, str] | None = None,
         function_call: LLMFunctionCall | None = None,
         recipient: str = "",
+        tainted: bool = False,
     ) -> ChatDocument:
         """Template for agent_response."""
         return self.response_template(
@@ -627,6 +637,7 @@ class Agent(ABC):
             oai_tool_id2result=oai_tool_id2result,
             function_call=function_call,
             recipient=recipient,
+            tainted=tainted,
         )
 
     def render_agent_response(
@@ -708,6 +719,15 @@ class Agent(ABC):
                 # preserve trail of tool_ids for OpenAI Assistant fn-calls
                 tool_ids=(
                     [] if msg is None or isinstance(msg, str) else msg.metadata.tool_ids
+                ),
+                # content echo (#1035): a string result derived from handling
+                # a tainted msg -- or produced by a tainted tool riding an
+                # untainted msg -- stays tainted, so tool JSON echoed into it
+                # cannot be laundered into a trusted AGENT doc.
+                tainted=isinstance(msg, ChatDocument)
+                and (
+                    msg.metadata.tainted
+                    or any(getattr(t, "_tainted", False) for t in msg.tool_messages)
                 ),
             ),
         )
@@ -871,6 +891,7 @@ class Agent(ABC):
         oai_tool_id2result: OrderedDict[str, str] | None = None,
         function_call: LLMFunctionCall | None = None,
         recipient: str = "",
+        tainted: bool = False,
     ) -> ChatDocument:
         """Template for response from entity `e`."""
         return ChatDocument(
@@ -883,7 +904,31 @@ class Agent(ABC):
             function_call=function_call,
             oai_tool_choice=oai_tool_choice,
             metadata=ChatDocMetaData(
-                source=e, sender=e, sender_name=self.config.name, recipient=recipient
+                source=e,
+                sender=e,
+                sender_name=self.config.name,
+                recipient=recipient,
+                # Trust tools structurally produced by an LLM or agent/handler
+                # (explicit `tool_messages`): they must survive
+                # _filter_user_origin_tools after a Task relabels the sender to
+                # USER for a handoff. Content-only / echoed responses carry no
+                # structured tool_messages, so they are NOT marked and stay
+                # filtered (GHSA-gjgq-w2m6-wr5q). Known gap: tools repackaged
+                # from untrusted content (e.g. via get_tool_messages) are still
+                # trusted here -- see issue #1035 for the taint-propagation fix.
+                tools_from_agent=bool(tool_messages)
+                and e in (Entity.LLM, Entity.AGENT),
+                # DISTRUST signal (#1035): set for any USER-origin response
+                # (external user input -- create_user_response / to_ChatDocument
+                # of a USER string), when the caller passes tainted=True, or when
+                # the response repackages an already-tainted tool (e.g.
+                # DonePassTool/AgentDoneTool re-emitting tools parsed from a USER
+                # message). The Task result-wrap relabel builds ChatDocMetaData
+                # directly (not via this template), so trusted agent->agent
+                # handoffs are unaffected.
+                tainted=tainted
+                or e == Entity.USER
+                or any(getattr(t, "_tainted", False) for t in tool_messages),
             ),
         )
 
@@ -970,6 +1015,9 @@ class Agent(ABC):
                     agent_id=self.id,
                     source=source,
                     sender=sender,
+                    # interactive user input is external untrusted input; SYSTEM
+                    # (operator) input is trusted (#1035)
+                    tainted=sender == Entity.USER,
                     # preserve trail of tool_ids for OpenAI Assistant fn-calls
                     tool_ids=tool_ids,
                 ),
@@ -1087,8 +1135,16 @@ class Agent(ABC):
         oai_tool_id2result: OrderedDict[str, str] | None = None,
         function_call: LLMFunctionCall | None = None,
         recipient: str = "",
+        tainted: bool = False,
     ) -> ChatDocument:
-        """Template for llm_response."""
+        """Template for llm_response.
+
+        Args:
+            tainted: Mark the response as USER-derived. Handlers that re-emit
+                attacker-influenceable content as an LLM-labelled message must
+                pass the taint of the message they read it from, so the content
+                stays vetoed by :meth:`_filter_user_origin_tools` (#1035).
+        """
         return self.response_template(
             Entity.LLM,
             content=content,
@@ -1099,6 +1155,7 @@ class Agent(ABC):
             oai_tool_id2result=oai_tool_id2result,
             function_call=function_call,
             recipient=recipient,
+            tainted=tainted,
         )
 
     @no_type_check
@@ -1144,7 +1201,7 @@ class Agent(ABC):
             # streaming was enabled, AND we did not find a cached response.
             # If we are here, it means the response has not yet been displayed.
             cached = f"[red]{self.indent}(cached)[/red]" if response.cached else ""
-            print(cached + "[green]" + escape(response.message))
+            print(cached + "[green]" + escape(response.message or ""))
         async with self.lock:
             self.update_token_usage(
                 response,
@@ -1219,7 +1276,7 @@ class Agent(ABC):
             # If we are here, it means the response has not yet been displayed.
             cached = "[red](cached)[/red]" if response.cached else ""
             console.print(f"[green]{self.indent}", end="")
-            print(cached + "[green]" + escape(response.message))
+            print(cached + "[green]" + escape(response.message or ""))
         self.update_token_usage(
             response,
             prompt,
@@ -1269,6 +1326,71 @@ class Agent(ABC):
             return tool.recipient == "" or tool.recipient == self.config.name
         return True
 
+    def _filter_user_origin_tools(
+        self,
+        msg: str | ChatDocument | None,
+        tools: List[ToolMessage],
+    ) -> List[ToolMessage]:
+        """If ``msg`` is raw input from :attr:`Entity.USER`, drop any tools whose
+        ``request`` is not in :attr:`llm_tools_usable`.
+
+        Rationale: ``enable_message(..., use=False, handle=True)`` is meant to
+        register tools triggered by an LLM's output (this agent's, or another
+        agent's in a multi-agent setup). A raw user input that happens to
+        contain such a tool's JSON should not bypass the LLM and invoke the
+        handler directly (GHSA-gjgq-w2m6-wr5q).
+
+        Legitimate agent-to-agent handoffs are preserved: when a Task relays
+        another agent's LLM/handler output to a sub-agent it relabels the
+        sender to ``USER`` but sets ``metadata.tools_from_agent=True``; such
+        messages are returned unchanged, since their tools came from an LLM,
+        not from raw user input.
+
+        Defense in depth (#1035): external user input is marked
+        ``metadata.tainted`` (ChatDocument.from_str / to_ChatDocument), the mark
+        propagates through deepcopies and the ``DonePassTool``/``AgentDoneTool``
+        repackage path, and a tainted message has its handle-only tools dropped
+        here even when ``tools_from_agent`` is set and the sender was relabeled
+        to USER. This closes the known content-laundering path through those
+        orchestration tools.
+
+        Residual: taint cannot flow through an LLM generation, so an LLM that is
+        prompt-injected into emitting tool JSON in its *content* stays out of
+        scope (the LLM-trust boundary). Broadening taint to every mechanical
+        derivation is tracked in issue #1035.
+
+        Non-``ChatDocument`` inputs and non-``USER`` senders are returned
+        unchanged.
+        """
+        # Tool-level veto (#1035 Step A): a tool object marked ``_tainted``
+        # was parsed out of external-USER-derived content somewhere upstream;
+        # never dispatch it to a handle-only handler, regardless of which
+        # document now carries it or that document's sender/taint labels.
+        tools = [
+            t
+            for t in tools
+            if t.default_value("request") in self.llm_tools_usable
+            or not getattr(t, "_tainted", False)
+        ]
+        if not isinstance(msg, ChatDocument):
+            return tools
+        if msg.metadata.tainted:
+            # Untrusted (USER-derived) content mechanically laundered into
+            # structured tools -- e.g. DonePassTool/AgentDoneTool re-emitting
+            # tools parsed from a USER message. Veto handle-only tools even when
+            # tools_from_agent is set and the sender was relabeled to USER. (#1035)
+            return [
+                t for t in tools if t.default_value("request") in self.llm_tools_usable
+            ]
+        if msg.metadata.sender != Entity.USER:
+            return tools
+        if msg.metadata.tools_from_agent:
+            # Tools were produced by an agent's LLM/handler (possibly relayed
+            # across a multi-agent handoff), not raw user input -- safe to
+            # dispatch handle-only tools.
+            return tools
+        return [t for t in tools if t.default_value("request") in self.llm_tools_usable]
+
     def has_only_unhandled_tools(self, msg: str | ChatDocument) -> bool:
         """
         Does the msg have at least one tool, and none of the tools in the msg are
@@ -1297,12 +1419,50 @@ class Agent(ABC):
         all_tools: bool = False,
     ) -> List[ToolMessage]:
         """
+        Get ToolMessages recognized in msg, handle-able by this agent,
+        stamping each with the source doc's taint mark (see #1035).
+
+        NOTE: as a side-effect, this will update msg.tool_messages
+        when msg is a ChatDocument and msg contains tool messages.
+
+        Args:
+            msg (str|ChatDocument): the message to extract tools from.
+            all_tools (bool):
+                - if True, return all tools,
+                    i.e. any recognized tool in self.llm_tools_known,
+                    whether it is handled by this agent or not;
+                - otherwise, return only the tools handled by this agent.
+
+        Returns:
+            List[ToolMessage]: list of ToolMessage objects
+        """
+        tools = self._get_tool_messages_inner(msg, all_tools)
+        if isinstance(msg, ChatDocument) and msg.metadata.tainted and tools:
+            # Taint rides the tool objects themselves (#1035): a tool parsed
+            # out of (or attached to) a tainted doc keeps the mark wherever
+            # it is later re-emitted or repackaged, so laundering it into a
+            # fresh "trusted-looking" ChatDocument cannot wash it clean.
+            # Copy-on-stamp: tools ATTACHED to the doc may be shared/reusable
+            # objects, so mark deep copies, and swap the copies into the
+            # doc's caches (doc-scoped state) so repeated calls agree.
+            marked = {id(t): self._tainted_copy(t) for t in tools}
+            tools = [marked[id(t)] for t in tools]
+            msg.tool_messages = [marked.get(id(t), t) for t in msg.tool_messages]
+            if msg.all_tool_messages is not None:
+                msg.all_tool_messages = [
+                    marked.get(id(t), t) for t in msg.all_tool_messages
+                ]
+        return tools
+
+    def _get_tool_messages_inner(
+        self,
+        msg: str | ChatDocument | None,
+        all_tools: bool = False,
+    ) -> List[ToolMessage]:
+        """
         Get ToolMessages recognized in msg, handle-able by this agent.
         NOTE: as a side-effect, this will update msg.tool_messages
         when msg is a ChatDocument and msg contains tool messages.
-        The intent here is that update=True should be set ONLY within agent_response()
-        or agent_response_async() methods. In other words, we want to persist the
-        msg.tool_messages only AFTER the agent has had a chance to handle the tools.
 
         Args:
             msg (str|ChatDocument): the message to extract tools from.
@@ -1330,10 +1490,6 @@ class Agent(ABC):
                     if self._tool_recipient_match(t) and t.default_value("request")
                 ]
 
-        if all_tools and len(msg.all_tool_messages) > 0:
-            # We've already identified all_tool_messages in the msg;
-            # return the corresponding ToolMessage objects
-            return msg.all_tool_messages
         if len(msg.tool_messages) > 0:
             # We've already found tool_messages,
             # (either via OpenAI Fn-call or Langroid-native ToolMessage);
@@ -1343,9 +1499,24 @@ class Agent(ABC):
             if all_tools:
                 return msg.tool_messages
             return [t for t in msg.tool_messages if self._tool_recipient_match(t)]
+
+        if (
+            msg.all_tool_messages is not None
+            and msg.all_tool_messages_agent_id == self.id
+        ):
+            # We've already identified all_tool_messages in the msg by this same agent;
+            # so use them to return the corresponding ToolMessage objects
+            if all_tools:
+                return msg.all_tool_messages
+            msg.tool_messages = [
+                t for t in msg.all_tool_messages if self._tool_recipient_match(t)
+            ]
+            return msg.tool_messages
+
         assert isinstance(msg, ChatDocument)
         if (
-            msg.content != ""
+            SearchForTools.CONTENT.value in self.search_for_tools
+            and msg.content != ""
             and msg.oai_tool_calls is None
             and msg.function_call is None
         ):
@@ -1354,6 +1525,7 @@ class Agent(ABC):
                 msg.content, from_llm=msg.metadata.sender == Entity.LLM
             )
             msg.all_tool_messages = tools
+            msg.all_tool_messages_agent_id = self.id
             # filter for actually handle-able tools, and recipient is this agent
             my_tools = [t for t in tools if self._tool_recipient_match(t)]
             msg.tool_messages = my_tools
@@ -1364,16 +1536,22 @@ class Agent(ABC):
                 return my_tools
 
         # otherwise, we look for `tool_calls` (possibly multiple)
-        tools = self.get_oai_tool_calls_classes(msg)
-        msg.all_tool_messages = tools
-        my_tools = [t for t in tools if self._tool_recipient_match(t)]
-        msg.tool_messages = my_tools
+        if SearchForTools.TOOLS.value in self.search_for_tools:
+            tools = self.get_oai_tool_calls_classes(msg)
+            msg.all_tool_messages = tools
+            msg.all_tool_messages_agent_id = self.id
+            my_tools = [t for t in tools if self._tool_recipient_match(t)]
+            msg.tool_messages = my_tools
+        else:
+            tools = []
+            my_tools = []
 
-        if len(tools) == 0:
+        if len(tools) == 0 and SearchForTools.FUNCTIONS.value in self.search_for_tools:
             # otherwise, we look for a `function_call`
             fun_call_cls = self.get_function_call_class(msg)
             tools = [fun_call_cls] if fun_call_cls is not None else []
             msg.all_tool_messages = tools
+            msg.all_tool_messages_agent_id = self.id
             my_tools = [t for t in tools if self._tool_recipient_match(t)]
             msg.tool_messages = my_tools
         if all_tools:
@@ -1634,6 +1812,14 @@ class Agent(ABC):
             # as a response to the tool message even though the tool was not intended
             # for this agent.
             return None
+        # Security: USER-origin tool JSON must not be able to invoke tools that
+        # the LLM itself is not allowed to use. ``enable_message(..., use=False,
+        # handle=True)`` is intended for tools triggered by an LLM's output (this
+        # agent's or, in multi-agent setups, another agent's), not by raw user
+        # input. Filtering here ensures that an end user typing tool JSON cannot
+        # bypass the LLM and directly invoke such a handler
+        # (GHSA-gjgq-w2m6-wr5q).
+        tools = self._filter_user_origin_tools(msg, tools)
         if len(tools) > 1 and not self.config.allow_multiple_tools:
             return self.to_ChatDocument("ERROR: Use ONE tool at a time!")
         if len(tools) == 0:
@@ -1698,6 +1884,9 @@ class Agent(ABC):
             # as a response to the tool message even though the tool was not intended
             # for this agent.
             return None
+        # Security: see ``handle_message_async`` -- the same USER-origin filter
+        # also applies on the sync path (GHSA-gjgq-w2m6-wr5q).
+        tools = self._filter_user_origin_tools(msg, tools)
         if len(tools) == 0:
             fallback_result = self.handle_message_fallback(msg)
             if fallback_result is None:
@@ -1875,15 +2064,41 @@ class Agent(ABC):
 
         is_agent_author = author_entity == Entity.AGENT
 
+        # Taint of the source doc rides mechanical derivations (#1035): a
+        # handler result (str or arbitrary obj) derived from a tainted msg
+        # yields a tainted doc. ToolMessage results instead carry their own
+        # per-tool ``_tainted`` mark, checked in ``response_template``.
+        src_tainted = chat_doc is not None and chat_doc.metadata.tainted
         if isinstance(msg, str):
-            return self.response_template(author_entity, content=msg, content_any=msg)
+            # USER-author strings (e.g. Task.run user input) are tainted by
+            # response_template (#1035).
+            return self.response_template(
+                author_entity, content=msg, content_any=msg, tainted=src_tainted
+            )
         elif isinstance(msg, ToolMessage):
+            # A tool returned by a fallback/handler while processing a tainted
+            # doc repackages untrusted fields (#1035); stamp it before it
+            # enters the dispatch below, so the recursion veto, the handler-hop
+            # threading, and response_template's tool check all see the mark.
+            # LLM-AUTHORED tool results (e.g. a custom llm_response returning a
+            # ToolMessage, converted by Task.response with author_entity=LLM)
+            # are the trusted LLM-generation boundary and are NOT stamped.
+            # Copy-on-stamp: msg may be a shared/config-held instance (e.g.
+            # a reusable handle_llm_no_tool ToolMessage) -- never mutate it.
+            if src_tainted and is_agent_author:
+                msg = self._tainted_copy(msg)
             # result is a ToolMessage, so...
             result_tool_name = msg.default_value("request")
             if (
                 is_agent_author
                 and result_tool_name in self.llm_tools_handled
                 and (orig_tool_name is None or orig_tool_name != result_tool_name)
+                # Recursive-hop veto (#1035): a handler-returned tool marked
+                # _tainted must get the same treatment as the filter's drop --
+                # if it is handle-only, do NOT execute it; fall through to the
+                # packaging branch below, which yields a tainted doc carrying
+                # the (unexecuted) tool.
+                and not (msg._tainted and result_tool_name not in self.llm_tools_usable)
             ):
                 # TODO: do we need to remove the tool message from the chat_doc?
                 # if (chat_doc is not None and
@@ -1903,7 +2118,9 @@ class Agent(ABC):
         return (
             None
             if result is None
-            else self.response_template(author_entity, content=result, content_any=msg)
+            else self.response_template(
+                author_entity, content=result, content_any=msg, tainted=src_tainted
+            )
         )
 
     def from_ChatDocument(self, msg: ChatDocument, output_type: Type[T]) -> Optional[T]:
@@ -1995,6 +2212,58 @@ class Agent(ABC):
             ) + truncate_warning
             return result
 
+    @staticmethod
+    def _tainted_copy(tool: ToolMessage) -> ToolMessage:
+        """Return a taint-marked version of ``tool`` without mutating it.
+
+        Copy-on-stamp (#1035): a tool object the framework did not just create
+        may be shared/reusable (e.g. a ToolMessage instance held in
+        ``handle_llm_no_tool`` config), so stamping ``_tainted`` in place
+        would permanently poison every later, clean use of it.
+
+        Args:
+            tool: The tool that must carry the taint mark.
+
+        Returns:
+            ``tool`` itself if already marked; otherwise a deep copy with
+            ``_tainted`` set (private attrs survive ``copy.deepcopy``).
+        """
+        if tool._tainted:
+            return tool
+        marked = copy.deepcopy(tool)
+        marked._tainted = True
+        return marked
+
+    @staticmethod
+    def _taint_tool_result(tool: ToolMessage, result: Any) -> Any:
+        """Carry the dispatched tool's ``_tainted`` mark into its handler
+        result (#1035).
+
+        The result may echo tool JSON from the untrusted content the tool was
+        parsed out of, so the taint must survive the handler hop even when the
+        carrying doc was untainted. Only ToolMessage results are stamped, via
+        a marked copy (so ``response_template``'s tool check taints the doc
+        they land in). A handler-returned ChatDocument keeps its own taint
+        label: the handler is trusted to label it (it may deliberately cross
+        a trust boundary, e.g. return a fresh untainted LLM generation), and
+        a doc derived via ``ChatDocument.deepcopy`` inherits taint anyway.
+        Plain str/object results are tainted at their mechanical conversion
+        site in ``handle_tool_message`` / ``handle_tool_message_async``.
+
+        Args:
+            tool: The tool that was dispatched to a handler.
+            result: The handler's raw result (str, ToolMessage, ChatDocument,
+                arbitrary object, or None).
+
+        Returns:
+            ``result`` itself, or a taint-marked copy when ``tool`` is
+            tainted and ``result`` is a ToolMessage.
+        """
+        if getattr(tool, "_tainted", False) and isinstance(result, ToolMessage):
+            # copy-on-stamp: the handler may return a shared instance
+            result = Agent._tainted_copy(result)
+        return result
+
     async def handle_tool_message_async(
         self,
         tool: ToolMessage,
@@ -2004,11 +2273,10 @@ class Agent(ABC):
         Asynch version of `handle_tool_message`. See there for details.
         """
         tool_name = tool.default_value("request")
-        if hasattr(tool, "_handler"):
-            handler_name = getattr(tool, "_handler", tool_name)
-        else:
-            handler_name = tool_name
-        handler_method = getattr(self, handler_name + "_async", None)
+        # resolve from the CLASS: an LLM-injected `_handler` key would
+        # otherwise redirect dispatch to an arbitrary method (issue #1106)
+        handler = handler_name(type(tool), tool_name)
+        handler_method = getattr(self, handler + "_async", None)
         if handler_method is None:
             return self.handle_tool_message(tool, chat_doc=chat_doc)
         has_chat_doc_arg = (
@@ -2020,7 +2288,18 @@ class Agent(ABC):
                 maybe_result = await handler_method(tool, chat_doc=chat_doc)
             else:
                 maybe_result = await handler_method(tool)
+            maybe_result = self._taint_tool_result(tool, maybe_result)
             result = self.to_ChatDocument(maybe_result, tool_name, chat_doc)
+            if (
+                isinstance(result, ChatDocument)
+                and not isinstance(maybe_result, (ChatDocument, ToolMessage))
+                and getattr(tool, "_tainted", False)
+            ):
+                # Mechanical conversion of a plain str/object result from a
+                # tainted tool (#1035): taint the framework-built doc. A
+                # handler-RETURNED ChatDocument keeps its trusted label, and
+                # a returned ToolMessage already carries its stamped copy.
+                result.metadata.tainted = True
         except Exception as e:
             # raise the error here since we are sure it's
             # not a pydantic validation error,
@@ -2047,11 +2326,10 @@ class Agent(ABC):
 
         """
         tool_name = tool.default_value("request")
-        if hasattr(tool, "_handler"):
-            handler_name = getattr(tool, "_handler", tool_name)
-        else:
-            handler_name = tool_name
-        handler_method = getattr(self, handler_name, None)
+        # resolve from the CLASS: an LLM-injected `_handler` key would
+        # otherwise redirect dispatch to an arbitrary method (issue #1106)
+        handler = handler_name(type(tool), tool_name)
+        handler_method = getattr(self, handler, None)
         if handler_method is None:
             return None
         has_chat_doc_arg = (
@@ -2063,7 +2341,18 @@ class Agent(ABC):
                 maybe_result = handler_method(tool, chat_doc=chat_doc)
             else:
                 maybe_result = handler_method(tool)
+            maybe_result = self._taint_tool_result(tool, maybe_result)
             result = self.to_ChatDocument(maybe_result, tool_name, chat_doc)
+            if (
+                isinstance(result, ChatDocument)
+                and not isinstance(maybe_result, (ChatDocument, ToolMessage))
+                and getattr(tool, "_tainted", False)
+            ):
+                # Mechanical conversion of a plain str/object result from a
+                # tainted tool (#1035): taint the framework-built doc. A
+                # handler-RETURNED ChatDocument keeps its trusted label, and
+                # a returned ToolMessage already carries its stamped copy.
+                result.metadata.tainted = True
         except Exception as e:
             # raise the error here since we are sure it's
             # not a pydantic validation error,
@@ -2081,7 +2370,7 @@ class Agent(ABC):
         else:
             return sum(
                 [
-                    self.parser.num_tokens(m.content)
+                    self.parser.num_tokens(m.content or "")
                     + self.parser.num_tokens(str(m.function_call or ""))
                     for m in prompt
                 ]
@@ -2165,7 +2454,7 @@ class Agent(ABC):
             cost = 0.0
             if not response.cached:
                 prompt_tokens = self.num_tokens(prompt)
-                completion_tokens = self.num_tokens(response.message)
+                completion_tokens = self.num_tokens(response.message or "")
                 if response.function_call is not None:
                     completion_tokens += self.num_tokens(str(response.function_call))
                 cost = self.compute_token_cost(prompt_tokens, 0, completion_tokens)

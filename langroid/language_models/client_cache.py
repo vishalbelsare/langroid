@@ -2,18 +2,24 @@
 Client caching/singleton pattern for LLM clients to prevent connection pool exhaustion.
 """
 
+import asyncio
 import atexit
 import hashlib
+import inspect
+import threading
+import time
 import weakref
-from typing import Any, Dict, Optional, Union, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union, cast
 
 from cerebras.cloud.sdk import AsyncCerebras, Cerebras
 from groq import AsyncGroq, Groq
 from httpx import Timeout
 from openai import AsyncOpenAI, OpenAI
 
-# Cache for client instances, keyed by hashed configuration parameters
-_client_cache: Dict[str, Any] = {}
+# Cache for client instances, keyed by hashed configuration parameters.
+# Value is a tuple of (client instance, last_used_monotonic_seconds).
+_client_cache: Dict[str, Tuple[Any, float]] = {}
+_client_cache_lock = threading.RLock()
 
 # Keep track of clients for cleanup
 _all_clients: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -43,8 +49,72 @@ def _get_cache_key(client_type: str, **kwargs: Any) -> str:
     return hashed_key
 
 
+def wrap_api_key_provider_async(
+    provider: Callable[[], str],
+) -> Callable[[], Awaitable[str]]:
+    """
+    Wrap a sync API-key provider for use with ``AsyncOpenAI``.
+
+    ``AsyncOpenAI`` awaits its ``api_key`` callable, so a plain sync
+    provider must be wrapped in an async function. The sync provider is run
+    in a worker thread, so a blocking token refresh cannot stall the event
+    loop. Providers must therefore be thread-safe -- the sync client may
+    call them from arbitrary threads anyway.
+
+    Args:
+        provider: Callable returning a (possibly short-lived) API key.
+
+    Returns:
+        Async callable returning the same key.
+    """
+
+    async def _provider() -> str:
+        return await asyncio.to_thread(provider)
+
+    return _provider
+
+
+def _api_key_cache_component(api_key: Union[str, Callable[[], str]]) -> Any:
+    """
+    Cache-key component for an API key that may be a rotating-key provider.
+
+    A callable provider is keyed on its identity rather than any token value,
+    so rotating tokens never create new cache entries and tokens are never
+    retained in cache keys. The id() cannot be recycled while the entry
+    lives, because the cached client holds a strong reference to the
+    provider (directly for sync clients, via the async wrapper's closure
+    for async clients).
+    """
+    if callable(api_key):
+        return ("api_key_provider", id(api_key))
+    return api_key
+
+
+def _get_cached_client(cache_key: str) -> Optional[Any]:
+    """Get cached client and refresh its last-used timestamp.
+
+    Must be called while holding ``_client_cache_lock``.
+    """
+    entry = _client_cache.get(cache_key)
+    if entry is None:
+        return None
+
+    client, _ = entry
+    _client_cache[cache_key] = (client, time.monotonic())
+    return client
+
+
+def _store_client(cache_key: str, client: Any) -> None:
+    """Store a client in the cache with the current timestamp.
+
+    Must be called while holding ``_client_cache_lock``.
+    """
+    _client_cache[cache_key] = (client, time.monotonic())
+    _all_clients.add(client)
+
+
 def get_openai_client(
-    api_key: str,
+    api_key: Union[str, Callable[[], str]],
     base_url: Optional[str] = None,
     organization: Optional[str] = None,
     timeout: Union[float, Timeout] = 120.0,
@@ -56,7 +126,10 @@ def get_openai_client(
     Get or create a singleton OpenAI client with the given configuration.
 
     Args:
-        api_key: OpenAI API key
+        api_key: OpenAI API key, or a callable returning a fresh key
+            (for short-lived rotating credentials); a callable is resolved
+            per-request by the OpenAI client and is excluded from the
+            cache key (the cache is keyed on the provider's identity)
         base_url: Optional base URL for API
         organization: Optional organization ID
         timeout: Request timeout
@@ -83,22 +156,9 @@ def get_openai_client(
         _all_clients.add(client)
         return client
 
-    # If http_client_config is provided, create client from config and cache
-    created_http_client = None
-    if http_client_config is not None:
-        try:
-            from httpx import Client
-
-            created_http_client = Client(**http_client_config)
-        except ImportError:
-            raise ValueError(
-                "httpx is required to use http_client_config. "
-                "Install it with: pip install httpx"
-            )
-
     cache_key = _get_cache_key(
         "openai",
-        api_key=api_key,
+        api_key=_api_key_cache_component(api_key),
         base_url=base_url,
         organization=organization,
         timeout=timeout,
@@ -106,25 +166,37 @@ def get_openai_client(
         http_client_config=http_client_config,  # Include config in cache key
     )
 
-    if cache_key in _client_cache:
-        return cast(OpenAI, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(OpenAI, cached_client)
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        organization=organization,
-        timeout=timeout,
-        default_headers=default_headers,
-        http_client=created_http_client,  # Use the client created from config
-    )
+        created_http_client = None
+        if http_client_config is not None:
+            try:
+                from httpx import Client
+            except ImportError:
+                raise ValueError(
+                    "httpx is required to use http_client_config. "
+                    "Install it with: pip install httpx"
+                )
+            created_http_client = Client(**http_client_config)
 
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            organization=organization,
+            timeout=timeout,
+            default_headers=default_headers,
+            http_client=created_http_client,  # Use the client created from config
+        )
+
+        _store_client(cache_key, client)
     return client
 
 
 def get_async_openai_client(
-    api_key: str,
+    api_key: Union[str, Callable[[], str]],
     base_url: Optional[str] = None,
     organization: Optional[str] = None,
     timeout: Union[float, Timeout] = 120.0,
@@ -136,7 +208,10 @@ def get_async_openai_client(
     Get or create a singleton AsyncOpenAI client with the given configuration.
 
     Args:
-        api_key: OpenAI API key
+        api_key: OpenAI API key, or a callable returning a fresh key
+            (for short-lived rotating credentials); a callable is resolved
+            per-request by the OpenAI client and is excluded from the
+            cache key (the cache is keyed on the provider's identity)
         base_url: Optional base URL for API
         organization: Optional organization ID
         timeout: Request timeout
@@ -150,10 +225,17 @@ def get_async_openai_client(
     if isinstance(timeout, (int, float)):
         timeout = Timeout(timeout)
 
+    api_key_arg: Union[str, Callable[[], Awaitable[str]]]
+    if callable(api_key):
+        # AsyncOpenAI awaits its api_key callable, so wrap the sync provider
+        api_key_arg = wrap_api_key_provider_async(api_key)
+    else:
+        api_key_arg = api_key
+
     # If http_client is provided directly, don't cache (complex object)
     if http_client is not None:
         client = AsyncOpenAI(
-            api_key=api_key,
+            api_key=api_key_arg,
             base_url=base_url,
             organization=organization,
             timeout=timeout,
@@ -163,22 +245,9 @@ def get_async_openai_client(
         _all_clients.add(client)
         return client
 
-    # If http_client_config is provided, create async client from config and cache
-    created_http_client = None
-    if http_client_config is not None:
-        try:
-            from httpx import AsyncClient
-
-            created_http_client = AsyncClient(**http_client_config)
-        except ImportError:
-            raise ValueError(
-                "httpx is required to use http_client_config. "
-                "Install it with: pip install httpx"
-            )
-
     cache_key = _get_cache_key(
         "async_openai",
-        api_key=api_key,
+        api_key=_api_key_cache_component(api_key),
         base_url=base_url,
         organization=organization,
         timeout=timeout,
@@ -186,20 +255,32 @@ def get_async_openai_client(
         http_client_config=http_client_config,  # Include config in cache key
     )
 
-    if cache_key in _client_cache:
-        return cast(AsyncOpenAI, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(AsyncOpenAI, cached_client)
 
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        organization=organization,
-        timeout=timeout,
-        default_headers=default_headers,
-        http_client=created_http_client,  # Use the client created from config
-    )
+        created_http_client = None
+        if http_client_config is not None:
+            try:
+                from httpx import AsyncClient
+            except ImportError:
+                raise ValueError(
+                    "httpx is required to use http_client_config. "
+                    "Install it with: pip install httpx"
+                )
+            created_http_client = AsyncClient(**http_client_config)
 
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = AsyncOpenAI(
+            api_key=api_key_arg,
+            base_url=base_url,
+            organization=organization,
+            timeout=timeout,
+            default_headers=default_headers,
+            http_client=created_http_client,  # Use the client created from config
+        )
+
+        _store_client(cache_key, client)
     return client
 
 
@@ -215,12 +296,13 @@ def get_groq_client(api_key: str) -> Groq:
     """
     cache_key = _get_cache_key("groq", api_key=api_key)
 
-    if cache_key in _client_cache:
-        return cast(Groq, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(Groq, cached_client)
 
-    client = Groq(api_key=api_key)
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = Groq(api_key=api_key)
+        _store_client(cache_key, client)
     return client
 
 
@@ -236,12 +318,13 @@ def get_async_groq_client(api_key: str) -> AsyncGroq:
     """
     cache_key = _get_cache_key("async_groq", api_key=api_key)
 
-    if cache_key in _client_cache:
-        return cast(AsyncGroq, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(AsyncGroq, cached_client)
 
-    client = AsyncGroq(api_key=api_key)
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = AsyncGroq(api_key=api_key)
+        _store_client(cache_key, client)
     return client
 
 
@@ -257,12 +340,13 @@ def get_cerebras_client(api_key: str) -> Cerebras:
     """
     cache_key = _get_cache_key("cerebras", api_key=api_key)
 
-    if cache_key in _client_cache:
-        return cast(Cerebras, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(Cerebras, cached_client)
 
-    client = Cerebras(api_key=api_key)
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = Cerebras(api_key=api_key)
+        _store_client(cache_key, client)
     return client
 
 
@@ -278,13 +362,50 @@ def get_async_cerebras_client(api_key: str) -> AsyncCerebras:
     """
     cache_key = _get_cache_key("async_cerebras", api_key=api_key)
 
-    if cache_key in _client_cache:
-        return cast(AsyncCerebras, _client_cache[cache_key])
+    with _client_cache_lock:
+        cached_client = _get_cached_client(cache_key)
+        if cached_client is not None:
+            return cast(AsyncCerebras, cached_client)
 
-    client = AsyncCerebras(api_key=api_key)
-    _client_cache[cache_key] = client
-    _all_clients.add(client)
+        client = AsyncCerebras(api_key=api_key)
+        _store_client(cache_key, client)
     return client
+
+
+def prune_cache(max_age_seconds: float) -> int:
+    """
+    Remove cache entries whose last-used time exceeds *max_age_seconds*.
+
+    Evicted clients are **not** closed here because they may still be serving
+    in-flight requests.  Cleanup is handled by the ``atexit`` handler and the
+    garbage collector.
+
+    Args:
+        max_age_seconds: Maximum age (in seconds) for cache entries to keep.
+            Entries older than this value are removed.
+
+    Returns:
+        Number of cache entries removed.
+    """
+    if max_age_seconds < 0:
+        raise ValueError("max_age_seconds must be non-negative")
+
+    now = time.monotonic()
+
+    with _client_cache_lock:
+        stale_keys = [
+            key
+            for key, (_, last_used_at) in _client_cache.items()
+            if now - last_used_at > max_age_seconds
+        ]
+
+        for key in stale_keys:
+            _client_cache.pop(key)
+
+    # Don't close evicted clients here — they may still be serving in-flight
+    # requests. The atexit handler and GC will clean them up.
+
+    return len(stale_keys)
 
 
 def _cleanup_clients() -> None:
@@ -292,8 +413,6 @@ def _cleanup_clients() -> None:
     Cleanup function to close all cached clients on exit.
     Called automatically via atexit.
     """
-    import inspect
-
     for client in list(_all_clients):
         if hasattr(client, "close") and callable(client.close):
             try:
@@ -316,4 +435,5 @@ atexit.register(_cleanup_clients)
 # For testing purposes
 def _clear_cache() -> None:
     """Clear the client cache. Only for testing."""
-    _client_cache.clear()
+    with _client_cache_lock:
+        _client_cache.clear()

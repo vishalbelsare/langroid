@@ -7,7 +7,9 @@ import re
 import threading
 from collections import Counter, OrderedDict, deque
 from enum import Enum
+from math import isnan
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 from typing import (
     Any,
@@ -142,6 +144,11 @@ class TaskConfig(BaseModel):
             to use string-based signaling, and it is recommended to use the
             new Orchestration tools instead (see agent/tools/orchestration.py),
             e.g. DoneTool, SendTool, etc.
+            Note: this is distinct from
+            ``ChatAgentConfig.recognize_recipient_in_content``, which controls
+            whether LLM response text is parsed for ``TO[<recipient>]:`` and
+            JSON ``{"recipient": ...}`` patterns at the Agent level.
+            To fully disable all text-based routing, set both to False.
         done_if_tool (bool): whether to consider the task done if the pending message
             contains a Tool attempt by the LLM
             (including tools not handled by the agent).
@@ -219,7 +226,7 @@ class Task:
         default_return_type: Optional[type] = None,
         done_if_no_response: List[Responder] = [],
         done_if_response: List[Responder] = [],
-        config: TaskConfig = TaskConfig(),
+        config: TaskConfig | None = None,
         **kwargs: Any,  # catch-all for any legacy params, for backwards compatibility
     ):
         """
@@ -301,6 +308,7 @@ class Task:
             show_subtask_response=noop_fn,
             set_parent_agent=noop_fn,
         )
+        config = config if config is not None else TaskConfig()
         self.config = config
         # Store parsed done sequences (will be initialized after agent assignment)
         self._parsed_done_sequences: Optional[List[DoneSequence]] = None
@@ -322,8 +330,8 @@ class Task:
         except Exception:
             logger.warning(
                 """
-                Failed to deep-copy Agent config during task creation, 
-                proceeding with original config. Be aware that changes to 
+                Failed to deep-copy Agent config during task creation,
+                proceeding with original config. Be aware that changes to
                 the config may affect other agents using the same config.
                 """
             )
@@ -619,6 +627,8 @@ class Task:
                 content=msg,
                 metadata=ChatDocMetaData(
                     sender=Entity.USER,
+                    # external user input -> untrusted (#1035)
+                    tainted=True,
                 ),
             )
         elif msg is None and len(self.agent.message_history) > 1:
@@ -637,6 +647,16 @@ class Task:
                 self.pending_message = ChatDocument.deepcopy(msg)
                 # Preserve the parent pointer from the original message
                 self.pending_message.metadata.parent_id = original_parent_id
+                # A USER-origin ChatDocument handed to a ROOT task (caller is
+                # None) is external untrusted input (e.g. Task.run(ChatDocument(
+                # sender=USER, ...))) that bypassed the tainting constructors --
+                # taint it. Sub-task inputs (caller is not None, relabeled to
+                # USER just below) keep their propagated taint; we only set. #1035
+                if (
+                    self.caller is None
+                    and self.pending_message.metadata.sender == Entity.USER
+                ):
+                    self.pending_message.metadata.tainted = True
             if self.pending_message is not None and self.caller is not None:
                 # msg may have come from `caller`, so we pretend this is from
                 # the CURRENT task's USER entity
@@ -660,12 +680,15 @@ class Task:
             and self.agent.system_message
         ):
             system_msg = self.agent._create_system_and_tools_message()
-            system_message_chat_doc = ChatDocument.from_LLMMessage(
+            system_message_temp_doc = ChatDocument.from_LLMMessage(
                 system_msg,
                 sender_name=self.name or "system",
             )
             # log the system message
-            self.log_message(Entity.SYSTEM, system_message_chat_doc, mark=True)
+            self.log_message(Entity.SYSTEM, system_message_temp_doc, mark=True)
+            # ChatDocument.__init__ auto-registers in ObjectRegistry; remove
+            # the temp doc explicitly to avoid leaking it across Task creations.
+            ChatDocument.delete_id(system_message_temp_doc.id())
         self.log_message(Entity.USER, self.pending_message, mark=True)
         return self.pending_message
 
@@ -750,6 +773,7 @@ class Task:
         max_tokens: int = 0,
         session_id: str = "",
         allow_restart: bool = True,
+        max_time: float = 0,
     ) -> Optional[ChatDocument]: ...  # noqa
 
     @overload
@@ -763,6 +787,7 @@ class Task:
         max_tokens: int = 0,
         session_id: str = "",
         allow_restart: bool = True,
+        max_time: float = 0,
         return_type: Type[T],
     ) -> Optional[T]: ...  # noqa
 
@@ -776,9 +801,14 @@ class Task:
         session_id: str = "",
         allow_restart: bool = True,
         return_type: Optional[Type[T]] = None,
+        max_time: float = 0,
     ) -> Optional[ChatDocument | T]:
         """Synchronous version of `run_async()`.
         See `run_async()` for details."""
+        if isnan(max_time):
+            raise ValueError("max_time must not be NaN")
+        started_at = monotonic() if max_time > 0 else None
+
         if allow_restart and (
             (self.restart and caller is None)
             or (self.config_sub_task.restart_as_subtask and caller is not None)
@@ -817,6 +847,7 @@ class Task:
         # self.turns overrides if it is > 0 and turns not set (i.e. = -1)
         turns = self.turns if turns < 0 else turns
         i = 0
+        budget_exhausted = False
         while True:
             self._step_idx = i  # used in step() below
             self.step()
@@ -828,9 +859,15 @@ class Task:
                 ):
                     self.response_sequence.append(self.pending_message)
             done, status = self.done()
+            budget_exhausted = (
+                started_at is not None and monotonic() - started_at >= max_time
+            )
             if done:
                 if self._level == 0 and not settings.quiet:
                     print("[magenta]Bye, hope this was useful!")
+                break
+            if budget_exhausted:
+                status = StatusCode.TIMEOUT
                 break
             i += 1
             max_turns = (
@@ -860,7 +897,7 @@ class Task:
                 raise InfiniteLoopException(
                     """Possible infinite loop detected!
                     You can adjust infinite loop detection (or turn it off)
-                    by changing the params in the TaskConfig passed to the Task 
+                    by changing the params in the TaskConfig passed to the Task
                     constructor; see here:
                     https://langroid.github.io/langroid/reference/agent/task/#langroid.agent.task.TaskConfig
                     """
@@ -881,6 +918,8 @@ class Task:
 
             if (
                 parsed_result is None
+                and status != StatusCode.TIMEOUT
+                and not budget_exhausted
                 and isinstance(self.agent, ChatAgent)
                 and self.agent._json_schema_available()
             ):
@@ -888,13 +927,18 @@ class Task:
                 output_args = strict_agent._function_args()[-1]
                 if output_args is not None:
                     schema = output_args.function.parameters
-                    strict_result = strict_agent.llm_response(
-                        f"""
-                        A response adhering to the following JSON schema was expected:
-                        {schema}
-
-                        Please resubmit with the correct schema. 
-                        """
+                    budget_exhausted = (
+                        started_at is not None and monotonic() - started_at >= max_time
+                    )
+                    strict_result = (
+                        None
+                        if budget_exhausted
+                        else strict_agent.llm_response(
+                            "A response adhering to the following JSON schema "
+                            "was expected:\n"
+                            f"{schema}\n\n"
+                            "Please resubmit with the correct schema."
+                        )
                     )
 
                     if strict_result is not None:
@@ -918,6 +962,7 @@ class Task:
         max_tokens: int = 0,
         session_id: str = "",
         allow_restart: bool = True,
+        max_time: float = 0,
     ) -> Optional[ChatDocument]: ...  # noqa
 
     @overload
@@ -931,6 +976,7 @@ class Task:
         max_tokens: int = 0,
         session_id: str = "",
         allow_restart: bool = True,
+        max_time: float = 0,
         return_type: Type[T],
     ) -> Optional[T]: ...  # noqa
 
@@ -944,6 +990,7 @@ class Task:
         session_id: str = "",
         allow_restart: bool = True,
         return_type: Optional[Type[T]] = None,
+        max_time: float = 0,
     ) -> Optional[ChatDocument | T]:
         """
         Loop over `step()` until task is considered done or `turns` is reached.
@@ -964,6 +1011,8 @@ class Task:
             caller (Task|None): the calling task, if any
             max_cost (float): max cost allowed for the task (default 0 -> no limit)
             max_tokens (int): max tokens allowed for the task (default 0 -> no limit)
+            max_time (float): max wall-clock seconds for the task. The limit is
+                checked after each completed step (default 0 -> no limit).
             session_id (str): session id for the task
             allow_restart (bool): whether to allow restarting the task
             return_type (Optional[Type[T]]): desired final result type
@@ -971,6 +1020,9 @@ class Task:
         Returns:
             Optional[ChatDocument]: valid result of the task.
         """
+        if isnan(max_time):
+            raise ValueError("max_time must not be NaN")
+        started_at = monotonic() if max_time > 0 else None
 
         # Even if the initial "sender" is not literally the USER (since the task could
         # have come from another LLM), as far as this agent is concerned, the initial
@@ -1015,14 +1067,29 @@ class Task:
         # self.turns overrides if it is > 0 and turns not set (i.e. = -1)
         turns = self.turns if turns < 0 else turns
         i = 0
+        budget_exhausted = False
         while True:
             self._step_idx = i  # used in step() below
             await self.step_async()
             await asyncio.sleep(0.01)  # temp yield to avoid blocking
+            # Track pending message in response sequence
+            if self.pending_message is not None:
+                if (
+                    not self.response_sequence
+                    or self.pending_message.id() != self.response_sequence[-1].id()
+                ):
+                    self.response_sequence.append(self.pending_message)
+
             done, status = self.done()
+            budget_exhausted = (
+                started_at is not None and monotonic() - started_at >= max_time
+            )
             if done:
                 if self._level == 0 and not settings.quiet:
                     print("[magenta]Bye, hope this was useful!")
+                break
+            if budget_exhausted:
+                status = StatusCode.TIMEOUT
                 break
             i += 1
             max_turns = (
@@ -1052,7 +1119,7 @@ class Task:
                 raise InfiniteLoopException(
                     """Possible infinite loop detected!
                     You can adjust infinite loop detection (or turn it off)
-                    by changing the params in the TaskConfig passed to the Task 
+                    by changing the params in the TaskConfig passed to the Task
                     constructor; see here:
                     https://langroid.github.io/langroid/reference/agent/task/#langroid.agent.task.TaskConfig
                     """
@@ -1073,6 +1140,8 @@ class Task:
 
             if (
                 parsed_result is None
+                and status != StatusCode.TIMEOUT
+                and not budget_exhausted
                 and isinstance(self.agent, ChatAgent)
                 and self.agent._json_schema_available()
             ):
@@ -1080,13 +1149,18 @@ class Task:
                 output_args = strict_agent._function_args()[-1]
                 if output_args is not None:
                     schema = output_args.function.parameters
-                    strict_result = await strict_agent.llm_response_async(
-                        f"""
-                        A response adhering to the following JSON schema was expected:
-                        {schema}
-
-                        Please resubmit with the correct schema. 
-                        """
+                    budget_exhausted = (
+                        started_at is not None and monotonic() - started_at >= max_time
+                    )
+                    strict_result = (
+                        None
+                        if budget_exhausted
+                        else await strict_agent.llm_response_async(
+                            "A response adhering to the following JSON schema "
+                            "was expected:\n"
+                            f"{schema}\n\n"
+                            "Please resubmit with the correct schema."
+                        )
                     )
 
                     if strict_result is not None:
@@ -1628,6 +1702,14 @@ class Task:
             result.content = result.content.replace(
                 f"{PASS_TO}:{recipient}", PASS
             ).strip()
+            # The replace above only handles the PASS_TO:<recipient> form; a
+            # pass-through expressed via an address prefix (@<recipient> or
+            # SEND_TO:<recipient>) with no content leaves the literal address in
+            # result.content, so step() would not recognize it as a pass-through
+            # (it checks `PASS in result.content`) and would forward the address
+            # string instead of the pending message. Normalize to PASS here.
+            if PASS not in result.content:
+                result.content = PASS
             return result
         elif recipient is not None:
             # we are sending non-empty content to non-null recipient
@@ -1798,6 +1880,22 @@ class Task:
                 tool_ids=tool_ids,
                 parent_id=result_msg.id() if result_msg else "",
                 agent_id=str(self.agent.id),
+                # Although we relabel sender to USER (to the parent task this
+                # result is equivalent to a USER response), structured tools
+                # being RELAYED here were produced by this task's agent/LLM, so
+                # the parent must still be able to dispatch them. Preserve the
+                # marking ONLY when actual `tool_messages` are relayed -- NOT
+                # for flattened/echoed content (e.g. a DoneTool whose `content`
+                # is untrusted text that happens to contain tool JSON), which
+                # must stay filtered (GHSA-gjgq-w2m6-wr5q; see also #1035).
+                tools_from_agent=(
+                    bool(tool_messages)
+                    and result_msg is not None
+                    and result_msg.metadata.tools_from_agent
+                ),
+                # Propagate the DISTRUST mark across the USER relabel so laundered
+                # (USER-derived) tools stay vetoed at the parent agent (#1035).
+                tainted=result_msg is not None and result_msg.metadata.tainted,
             ),
         )
         if self.pending_message is not None:
@@ -2254,8 +2352,9 @@ class Task:
                 str: content to send, or None
         """
         msg_str = msg.content if isinstance(msg, ChatDocument) else msg
+        has_tool_attempt = self.agent.has_tool_message_attempt(msg)
         if (
-            self.agent.has_tool_message_attempt(msg)
+            has_tool_attempt
             and not msg_str.startswith(PASS)
             and not msg_str.startswith(PASS_TO)
             and not msg_str.startswith(SEND_TO)
@@ -2274,6 +2373,12 @@ class Task:
         ):
             (addressee, content_to_send) = addressee_content
             if content_to_send == "":
+                if has_tool_attempt:
+                    # A bare address (no content after it) is a pass-through,
+                    # which would replace this msg with the pending message
+                    # and silently drop the tool attempt this msg carries;
+                    # so never treat a tool-bearing msg as a pass-through.
+                    return None, None, None
                 return True, addressee, None
             else:
                 return False, addressee, content_to_send
@@ -2287,6 +2392,12 @@ class Task:
         ):
             (addressee, content_to_send) = addressee_content
             if content_to_send == "":
+                if has_tool_attempt:
+                    # A bare address (no content after it) is a pass-through,
+                    # which would replace this msg with the pending message
+                    # and silently drop the tool attempt this msg carries;
+                    # so never treat a tool-bearing msg as a pass-through.
+                    return None, None, None
                 return True, addressee, None
             else:
                 return False, addressee, content_to_send

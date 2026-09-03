@@ -2068,9 +2068,265 @@ def test_tool_handler_invoking_llm(use_fn_api: bool):
     task = Task(agent, interactive=False, single_round=False)
     result = task.run(
         f"""
-        Use the TOOL `{NabroskiTool.name()}` to compute the 
+        Use the TOOL `{NabroskiTool.name()}` to compute the
         Nabroski transform of 2 and 5.
         """
     )
 
     assert "7" in result.content
+
+
+def test_enable_message_validates_arguments(test_settings: Settings):
+    """Test that enable_message raises TypeError when tool classes are passed
+    as separate arguments instead of as a list."""
+    set_global(test_settings)
+
+    class Tool1(ToolMessage):
+        request: str = "tool1"
+        purpose: str = "First tool"
+
+    class Tool2(ToolMessage):
+        request: str = "tool2"
+        purpose: str = "Second tool"
+
+    class Tool3(ToolMessage):
+        request: str = "tool3"
+        purpose: str = "Third tool"
+
+    agent = ChatAgent(
+        ChatAgentConfig(
+            llm=MockLMConfig(default_response="test"),
+        )
+    )
+
+    # This should raise TypeError because Tool2 is passed as 'use' parameter
+    with pytest.raises(TypeError, match="'use' parameter must be a boolean"):
+        agent.enable_message(Tool1, Tool2)  # type: ignore
+
+    # This should raise TypeError because Tool3 is passed as 'handle' parameter
+    with pytest.raises(TypeError, match="'handle' parameter must be a boolean"):
+        agent.enable_message(Tool1, True, Tool3)  # type: ignore
+
+    # This should work correctly - passing tools as a list
+    agent.enable_message([Tool1, Tool2, Tool3])
+    assert "tool1" in agent.llm_tools_usable
+    assert "tool2" in agent.llm_tools_usable
+    assert "tool3" in agent.llm_tools_usable
+
+
+def test_enable_message_rejects_distinct_classes_with_same_request() -> None:
+    """Different tool classes cannot silently replace the same request name."""
+
+    class FirstCollisionTool(ToolMessage):
+        request: str = "shared_request"
+        purpose: str = "First tool"
+
+    class SecondCollisionTool(ToolMessage):
+        request: str = "shared_request"
+        purpose: str = "Second tool"
+
+    class DerivedCollisionTool(FirstCollisionTool):
+        purpose: str = "Derived tool"
+
+    agent = ChatAgent(ChatAgentConfig(llm=None))
+    agent.enable_message(FirstCollisionTool)
+    agent.enable_message(FirstCollisionTool)
+
+    with pytest.raises(ValueError) as exc_info:
+        agent.enable_message(SecondCollisionTool)
+
+    message = str(exc_info.value)
+    assert "shared_request" in message
+    assert "FirstCollisionTool" in message
+    assert "SecondCollisionTool" in message
+    assert agent.llm_tools_map["shared_request"] is FirstCollisionTool
+
+    derived_agent = ChatAgent(ChatAgentConfig(llm=None))
+    derived_agent.enable_message(DerivedCollisionTool)
+    with pytest.raises(ValueError, match="shared_request"):
+        derived_agent.enable_message(FirstCollisionTool)
+    assert derived_agent.llm_tools_map["shared_request"] is DerivedCollisionTool
+
+    recipient_wrapper = FirstCollisionTool.require_recipient()
+
+    class DerivedRecipientCollisionTool(recipient_wrapper):  # type: ignore
+        purpose: str = "Derived recipient tool"
+
+    recipient_agent = ChatAgent(ChatAgentConfig(llm=None))
+    recipient_agent.enable_message(recipient_wrapper)
+    with pytest.raises(ValueError, match="shared_request"):
+        recipient_agent.enable_message(DerivedRecipientCollisionTool)
+    assert recipient_agent.llm_tools_map["shared_request"] is recipient_wrapper
+
+
+def test_enable_message_rejects_recipient_wrapper_subclass_origin() -> None:
+    """Recipient wrapping must preserve a subclass as a distinct tool origin."""
+
+    class OriginalTool(ToolMessage):
+        request: str = "recipient_collision"
+        purpose: str = "Original tool"
+
+    recipient_wrapper = OriginalTool.require_recipient()
+
+    class RecipientWrapperSubclass(recipient_wrapper):  # type: ignore
+        purpose: str = "Distinct recipient-wrapper subclass"
+
+    agent = ChatAgent(ChatAgentConfig(llm=None))
+    agent.enable_message(recipient_wrapper)
+
+    with pytest.raises(
+        ValueError,
+        match="Tool request name 'recipient_collision' is already registered",
+    ):
+        agent.enable_message(
+            RecipientWrapperSubclass,
+            require_recipient=True,
+        )
+
+    assert agent.llm_tools_map["recipient_collision"] is recipient_wrapper
+
+
+def test_any_tool_reenable_is_idempotent() -> None:
+    """Regenerated strict-recovery AnyTool must re-register without error.
+
+    `_get_any_tool_message()` builds a fresh class per call (its tool-union
+    varies with enabled tools), so two generations of "tool_or_function" are
+    distinct classes; the same-name registration guard must treat them as the
+    same logical tool (regression: SQLChatAgent strict recovery raised
+    "already registered to AnyTool; cannot register AnyTool").
+    """
+
+    class ToolA(ToolMessage):
+        request: str = "any_tool_idem_a"
+        purpose: str = "Tool A"
+
+    class ToolB(ToolMessage):
+        request: str = "any_tool_idem_b"
+        purpose: str = "Tool B"
+
+    agent = ChatAgent(ChatAgentConfig(llm=None))
+    agent.enable_message(ToolA)
+
+    any_tool_1 = agent._get_any_tool_message()
+    assert any_tool_1 is not None
+    agent.enable_message(any_tool_1, use=False, handle=True)
+
+    # enabling another tool changes the union => a distinct AnyTool class
+    agent.enable_message(ToolB)
+    any_tool_2 = agent._get_any_tool_message()
+    assert any_tool_2 is not None
+    assert any_tool_2 is not any_tool_1
+    agent.enable_message(any_tool_2, use=False, handle=True)  # must not raise
+
+    assert agent.llm_tools_map["tool_or_function"] is any_tool_2
+
+
+def test_multi_agent_tool_caching(test_settings: Settings):
+    """
+    Test that tool message caching is agent-specific.
+
+    When Agent A parses a ChatDocument and caches tool messages,
+    Agent B (with different tools) should NOT use A's cached results
+    and should re-parse the message with its own tool registry.
+    """
+    set_global(test_settings)
+
+    # Define two different tools
+    class ToolA(ToolMessage):
+        request: str = "tool_a"
+        purpose: str = "Tool for Agent A"
+        value: str = "a"
+
+    class ToolB(ToolMessage):
+        request: str = "tool_b"
+        purpose: str = "Tool for Agent B"
+        value: str = "b"
+
+    # Create two agents with different tool registries
+    agent_a = ChatAgent(
+        ChatAgentConfig(
+            name="AgentA",
+            llm=MockLMConfig(default_response="test"),
+        )
+    )
+    agent_a.enable_message(ToolA)
+
+    agent_b = ChatAgent(
+        ChatAgentConfig(
+            name="AgentB",
+            llm=MockLMConfig(default_response="test"),
+        )
+    )
+    agent_b.enable_message(ToolB)
+
+    # Create a ChatDocument containing ToolB (which only AgentB knows about)
+    tool_b_json = json.dumps({"request": "tool_b", "value": "test_value"})
+    chat_doc = ChatDocument(
+        content=tool_b_json,
+        metadata=ChatDocMetaData(
+            source=Entity.LLM,
+            sender=Entity.LLM,
+        ),
+    )
+
+    # Agent A parses - should find no tools it handles (ToolB is unknown to A)
+    tools_from_a = agent_a.get_tool_messages(chat_doc, all_tools=True)
+    assert len(tools_from_a) == 0
+
+    # Verify cache was set by Agent A
+    assert chat_doc.all_tool_messages is not None
+    assert chat_doc.all_tool_messages_agent_id == agent_a.id
+
+    # Agent B parses the SAME ChatDocument - should re-parse and find ToolB
+    # because the cache was set by a different agent
+    tools_from_b = agent_b.get_tool_messages(chat_doc, all_tools=True)
+    assert len(tools_from_b) == 1
+    assert tools_from_b[0].request == "tool_b"
+    assert tools_from_b[0].value == "test_value"
+
+    # Verify cache was updated by Agent B
+    assert chat_doc.all_tool_messages_agent_id == agent_b.id
+
+    # Agent B parsing again should use the cache (same agent)
+    tools_from_b_cached = agent_b.get_tool_messages(chat_doc, all_tools=True)
+    assert len(tools_from_b_cached) == 1
+    assert tools_from_b_cached[0].request == "tool_b"
+
+
+def test_nested_tool_message_schema_is_cleaned() -> None:
+    """A ToolMessage nested inside another ToolMessage lands in the schema's
+    ``$defs``, and must get the same cleanup the top-level tool gets: internal
+    fields (``purpose``, ``id``) and the ``exclude`` marker removed, and
+    ``request`` pinned to its constant via an ``enum``.
+
+    Regression guard for the Pydantic v1->v2 migration: v1 emitted nested-model
+    schemas under ``definitions`` while v2 uses ``$defs``. If the cleanup keys
+    off the wrong name it silently no-ops, leaking those internal fields (and an
+    unconstrained ``request``) into the schema sent to the LLM.
+    """
+
+    class Inner(ToolMessage):
+        request: str = "inner_tool"
+        purpose: str = "the inner purpose"
+        x: int
+
+    class Outer(ToolMessage):
+        request: str = "outer_tool"
+        purpose: str = "the outer purpose"
+        inner: Inner
+
+    params = Outer.llm_function_schema(request=True).parameters
+    assert "$defs" in params
+    inner_schema = params["$defs"]["Inner"]
+
+    # internal markers/fields must not leak to the LLM
+    assert "exclude" not in inner_schema
+    assert "purpose" not in inner_schema["properties"]
+    assert "id" not in inner_schema["properties"]
+
+    # `request` is pinned to its constant and required
+    assert inner_schema["properties"]["request"] == {
+        "type": "string",
+        "enum": ["inner_tool"],
+    }
+    assert "request" in inner_schema["required"]

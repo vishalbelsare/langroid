@@ -5,6 +5,8 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from pydantic_settings import SettingsConfigDict
+
 from langroid.embedding_models.base import (
     EmbeddingModelsConfig,
 )
@@ -36,7 +38,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a SQL identifier (table/index name) for use in raw DDL, so a name
+    containing characters that are invalid in an unquoted identifier -- e.g.
+    the ``-`` in a pytest-xdist worker suffix like ``mycollection-gw1`` -- does
+    not produce a syntax error. Embedded double-quotes are escaped per the SQL
+    standard.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 class PostgresDBConfig(VectorStoreConfig):
+    model_config = SettingsConfigDict(env_prefix="POSTGRES_")
+
     collection_name: str = "embeddings"
     cloud: bool = False
     docker: bool = True
@@ -51,7 +65,8 @@ class PostgresDBConfig(VectorStoreConfig):
 
 
 class PostgresDB(VectorStore):
-    def __init__(self, config: PostgresDBConfig = PostgresDBConfig()):
+    def __init__(self, config: PostgresDBConfig | None = None):
+        config = config if config is not None else PostgresDBConfig()
         super().__init__(config)
         if not has_postgres:
             raise LangroidImportError("pgvector", "postgres")
@@ -146,8 +161,8 @@ class PostgresDB(VectorStore):
                 connection.execute(text("COMMIT"))
                 create_index_query = text(
                     f"""
-                    CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
-                    ON {self.config.collection_name}
+                    CREATE INDEX CONCURRENTLY IF NOT EXISTS {_quote_ident(index_name)}
+                    ON {_quote_ident(self.config.collection_name)}
                     USING hnsw (embedding vector_cosine_ops)
                     WITH (
                         m = {self.config.hnsw_m},
@@ -223,7 +238,9 @@ class PostgresDB(VectorStore):
         with self.engine.connect() as connection:
             connection.execute(text("COMMIT"))
             index_name = f"hnsw_index_{collection_name}_embedding"
-            drop_index_query = text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+            drop_index_query = text(
+                f"DROP INDEX CONCURRENTLY IF EXISTS {_quote_ident(index_name)}"
+            )
             connection.execute(drop_index_query)
 
             # 3. Now, drop the table using SQLAlchemy

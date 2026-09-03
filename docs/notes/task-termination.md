@@ -26,6 +26,7 @@ This guide introduces Langroid's declarative approach to task termination, culmi
 - [Implementation Details](#implementation-details)
 - [Best Practices](#best-practices)
 - [Reference](#reference)
+- [Text-Based Termination Signals](#text-based-termination-signals)
 
 ## Overview
 
@@ -38,6 +39,32 @@ In Langroid, a `Task` wraps an `Agent` and manages the conversation flow. Contro
 # Task runs for exactly 5 turns
 result = task.run("Start conversation", turns=5)
 ```
+
+### Wall-clock budget
+
+Long-running agent workflows can also stop after a wall-clock budget:
+
+```python
+result = task.run("Start research", max_time=30.0)
+```
+
+The synchronous and asynchronous run loops check this cooperative limit after
+each completed step and its completion checks, immediately before deciding
+whether another step may begin. They do not interrupt an in-flight LLM, tool,
+or delegated task call, so the elapsed time can exceed `max_time` by the
+duration of that call. This avoids leaving agent or tool state half-updated.
+Each task run owns its budget; a delegated run does not implicitly inherit its
+parent's deadline. If a step both completes the task and exhausts the budget,
+completion wins. Otherwise, when the budget is exhausted, the returned
+`ChatDocument` has `metadata.status == StatusCode.TIMEOUT`.
+
+When a budgeted run requests a strict `return_type`, Langroid may decode the
+last response locally. It checks the deadline again immediately before any LLM
+call that would repair malformed structured output, including when completion
+or local decoding consumed the remaining time. After expiry, it returns the
+locally decoded value or `None`. A non-positive `max_time` keeps the existing
+unlimited behavior. NaN is rejected with `ValueError` because it is neither
+positive nor non-positive.
 
 ### 2. Single Round Mode
 ```python
@@ -67,6 +94,9 @@ config = TaskConfig(
 # Task completes when special strings like "DONE" are detected
 # (enabled by default with recognize_string_signals=True)
 ```
+
+See [Text-Based Routing and Signal Control](#text-based-routing-and-signal-control)
+for detailed documentation on controlling text-based routing behavior.
 
 ### 6. Orchestration Tools
 ```python
@@ -443,6 +473,43 @@ This provides better type safety and makes refactoring easier.
 - Consider shorter sequences for better performance
 - Use specific tool names to avoid unnecessary checks
 
+## Text-Based Termination Signals
+
+### `TaskConfig.recognize_string_signals`
+
+Controls whether the task recognizes text-based orchestration signals like `DONE`,
+`PASS`, `DONE_PASS`, etc.
+
+```python
+from langroid.agent.task import Task, TaskConfig
+
+# Default: signals are recognized
+task = Task(agent, config=TaskConfig(recognize_string_signals=True))
+
+# Disable: signals treated as plain text
+task = Task(agent, config=TaskConfig(recognize_string_signals=False))
+```
+
+**When `True` (default):**
+
+- `DONE` in a response signals task completion
+- `PASS` signals passing control to another agent
+- `DONE_PASS` combines both behaviors
+
+**When `False`:**
+
+- These strings are treated as literal text
+- Useful when LLM responses might accidentally contain these keywords
+- Task termination must use other mechanisms (tools, `done_sequences`, etc.)
+
+Note that `PASS` also relates to message routing between agents. For more details
+on text-based routing and the related `recognize_recipient_in_content` setting,
+see [Message Routing](message-routing.md).
+
 ## Summary
 
-The `done_sequences` feature provides a powerful, declarative way to control task termination based on conversation patterns. The DSL syntax makes common cases simple while the full object syntax provides complete control when needed. This approach eliminates the need to subclass `Task` and override `done()` for most use cases, leading to cleaner, more maintainable code.
+The `done_sequences` feature provides a powerful, declarative way to control task
+termination based on conversation patterns. The DSL syntax makes common cases
+simple while the full object syntax provides complete control when needed. This
+approach eliminates the need to subclass `Task` and override `done()` for most
+use cases, leading to cleaner, more maintainable code.

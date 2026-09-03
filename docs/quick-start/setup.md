@@ -103,8 +103,15 @@ to use specific features (as noted below).
 
 - **Qdrant** Vector Store API Key, URL. This is only required if you want to use Qdrant cloud.
   Langroid uses LanceDB as the default vector store in its `DocChatAgent` class (for RAG).
-  Alternatively [Chroma](https://docs.trychroma.com/) is also currently supported.
+  Alternatively [Chroma](https://docs.trychroma.com/) and
+  [Milvus](https://milvus.io/) are also currently supported.
   We use the local-storage version of Chroma, so there is no need for an API key.
+- **Milvus** Vector Store URI, token, database name. These are optional.
+  Without them, Milvus uses local storage at `./milvus.db`. Set `MILVUS_URI`
+  for Milvus server or Zilliz Cloud, `MILVUS_TOKEN` for token-based access,
+  and `MILVUS_DB_NAME` for a named database. Milvus Lite is unavailable on
+  Windows, so Windows users must set `MILVUS_URI` to a Milvus server or Zilliz
+  Cloud endpoint.
 - **Redis** Password, host, port: This is optional, and only needed to cache LLM API responses
   using Redis Cloud. Redis [offers](https://redis.com/try-free/) a free 30MB Redis account
   which is more than sufficient to try out Langroid and even beyond.
@@ -113,7 +120,12 @@ to use specific features (as noted below).
 - **GitHub** Personal Access Token (required for apps that need to analyze git
   repos; token-based API calls are less rate-limited). See this
   [GitHub page](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
-- **Google Custom Search API Credentials:** Only needed to enable an Agent to use the `GoogleSearchTool`.
+- **Google Custom Search API Credentials (DEPRECATED):** Only needed for the
+  `GoogleSearchTool`, which is deprecated: Google's Custom Search JSON API is
+  [closed to new customers and discontinued on January 1, 2027](https://developers.google.com/custom-search/v1/overview).
+  New users should use `TavilySearchTool` (`TAVILY_API_KEY`), `ExaSearchTool`
+  (`EXA_API_KEY`), or the key-free `DuckduckgoSearchTool` instead. The setup
+  below remains for users with existing credentials.
   To use Google Search as an LLM Tool/Plugin/function-call,
   you'll need to set up
   [a Google API key](https://developers.google.com/custom-search/v1/introduction#identify_your_application_to_google_with_api_key),
@@ -126,7 +138,7 @@ to use specific features (as noted below).
   [`tests/main/test_web_search_tools.py`](https://github.com/langroid/langroid/blob/main/tests/main/test_web_search_tools.py) to see how to use it.
 
 
-If you add all of these optional variables, your `.env` file should look like this:
+An `.env` file with commonly used optional variables looks like this:
 ```bash
 OPENAI_API_KEY=your-key-here-without-quotes
 GITHUB_ACCESS_TOKEN=your-personal-access-token-no-quotes
@@ -139,6 +151,13 @@ QDRANT_API_URL=https://your.url.here:6333 # note port number must be included
 GOOGLE_API_KEY=your-key
 GOOGLE_CSE_ID=your-cse-id
 ```
+
+!!! warning "Vector-store settings need a provider prefix (0.67.0+)"
+    Vector-store config fields can also be set via env vars, but only
+    with a per-provider prefix, e.g. `QDRANT_HOST`, `LANCEDB_STORAGE_PATH`,
+    `VECDB_FULL_EVAL`. Bare names like `HOST`, `PORT`, or `FULL_EVAL`
+    are ignored as of Langroid 0.67.0 — see
+    [Vector-Store Env Prefixes](../notes/vecstore-env-prefix.md).
 
 ### Microsoft Azure OpenAI setup[Optional]
 

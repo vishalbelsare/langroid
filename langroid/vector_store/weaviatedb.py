@@ -4,6 +4,7 @@ import re
 from typing import Any, List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
+from pydantic_settings import SettingsConfigDict
 
 from langroid.embedding_models.base import (
     EmbeddingModelsConfig,
@@ -28,6 +29,8 @@ class VectorDistances:
 
 
 class WeaviateDBConfig(VectorStoreConfig):
+    model_config = SettingsConfigDict(env_prefix="WEAVIATE_")
+
     collection_name: str | None = "temp"
     embedding: EmbeddingModelsConfig = OpenAIEmbeddingsConfig()
     distance: str = VectorDistances.COSINE
@@ -39,7 +42,8 @@ class WeaviateDBConfig(VectorStoreConfig):
 
 
 class WeaviateDB(VectorStore):
-    def __init__(self, config: WeaviateDBConfig = WeaviateDBConfig()):
+    def __init__(self, config: WeaviateDBConfig | None = None):
+        config = config if config is not None else WeaviateDBConfig()
         super().__init__(config)
         try:
             import weaviate

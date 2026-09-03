@@ -67,10 +67,17 @@ jobs:
           POSTGRES_DB: langroid 
         ports:
           - "5432:5432"
+      qdrant:
+        image: qdrant/qdrant:v1.15.5
+        ports:
+          - "6333:6333"
+        env:
+          QDRANT__SERVICE__API_KEY: local-dev-key
 
 
     env:
       CI: true # allows conditional skipping of tests based on this env var
+      TEST_MCP_NPX: true # allow NPX MCP tests
       OPENAI_API_KEY: ${{ secrets.OPENAI_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -78,8 +85,12 @@ jobs:
       REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
       REDIS_HOST: ${{ secrets.REDIS_HOST }}
       REDIS_PORT: ${{ secrets.REDIS_PORT }}
-      QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
-      QDRANT_API_URL: ${{ secrets.QDRANT_API_URL }}
+      # Point Qdrant tests at the local `qdrant` service container (defined
+      # above), NOT Qdrant Cloud, to avoid ongoing cloud-cluster billing.
+      # The cloud secrets are intentionally bypassed; restore them here if
+      # cloud-specific testing is ever needed again.
+      QDRANT_API_KEY: local-dev-key
+      QDRANT_API_URL: http://localhost:6333
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
@@ -90,6 +101,7 @@ jobs:
       LANGDB_API_KEY: ${{ secrets.LANGDB_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: langroid 
@@ -105,6 +117,13 @@ jobs:
     steps:
     - name: Check out repository
       uses: actions/checkout@v3
+    - name: Free disk space (remove SDKs and prune Docker)
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+        docker system prune -af
+        docker volume prune -f
+        df -h
+        docker system df
     - name: Increase ulimit
       run: ulimit -n 4096
     - name: Set up Python
@@ -117,6 +136,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libmagic1
         sudo apt-get install -y poppler-utils tesseract-ocr
+        sudo apt-get clean
+        sudo rm -rf /var/lib/apt/lists/*
     # - name: Restore uv cache 
     #   uses: actions/cache@v4
     #   with: 
@@ -153,6 +174,7 @@ jobs:
           --extra pymupdf4llm \
           --extra weaviate \
           --extra pinecone \
+          --extra milvus \
           --extra postgres\
           --extra hf-embeddings \
           --extra unstructured \
@@ -168,8 +190,20 @@ jobs:
       
     
 
-    - name: Download ALL NLTK data (needed by unstructured and others)
-      run: uv run python -c "import nltk; nltk.download('all')"
+    - name: Download minimal NLTK data
+      run: |
+        uv run python - <<'PY'
+        import nltk
+        for pkg in [
+            "punkt",            # tokenization
+            "punkt_tab",        # tokenization (NLTK >=3.9 renamed punkt)
+            "stopwords",        # stopword removal
+            "wordnet",          # lemmatization
+            "omw-1.4",          # wordnet data
+            "gutenberg",        # sample corpus used in tests
+        ]:
+            nltk.download(pkg)
+        PY
 
     - name: Dump dependencies to file
       run: uv pip freeze > requirements_github.txt

@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from langroid.exceptions import LangroidImportError
 from langroid.mytypes import DocMetaData, Document
 from langroid.parsing.document_parser import DocumentParser, ImagePdfParser
+from langroid.parsing.document_url import fetch_configured_url
 from langroid.parsing.parser import Parser, ParsingConfig
 
 if TYPE_CHECKING:
@@ -30,6 +31,29 @@ if TYPE_CHECKING:
 load_dotenv()
 
 logging.getLogger("url_loader").setLevel(logging.WARNING)
+
+
+def _limit_hint(e: Exception, config: ParsingConfig) -> str:
+    """Actionable suffix for a URL-fetch error caused by the configured limits.
+
+    Returns an empty string for errors unrelated to the limits.
+    """
+    import requests
+    from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
+
+    timed_out = isinstance(e, requests.exceptions.Timeout) or (
+        # requests wraps read-timeouts during streamed body reads in
+        # ConnectionError, not Timeout
+        isinstance(e, requests.exceptions.ConnectionError)
+        and any(isinstance(arg, Urllib3TimeoutError) for arg in e.args)
+    )
+    if timed_out:
+        return (
+            "; if the server is just slow, increase "
+            f"ParsingConfig.url_connect_timeout (now {config.url_connect_timeout}s)"
+            f" / url_read_timeout (now {config.url_read_timeout}s)"
+        )
+    return ""
 
 
 # Base crawler config and specific configurations
@@ -129,14 +153,23 @@ class BaseCrawler(ABC):
                         new_chunks = img_parser.get_doc_chunks()
                     return new_chunks
                 except Exception as e:
-                    logging.error(f"Error parsing {url}: {e}")
+                    hint = _limit_hint(e, self.parser.config)
+                    logging.error(f"Error parsing {url}: {e}{hint}")
                     return []
 
             else:
+                config = self.parser.config
                 try:
-                    headers = requests.head(url).headers
+                    headers = requests.head(
+                        url,
+                        timeout=(
+                            config.url_connect_timeout,
+                            config.url_read_timeout,
+                        ),
+                    ).headers
                 except Exception as e:
-                    logging.warning(f"Error getting headers for {url}: {e}")
+                    hint = _limit_hint(e, config)
+                    logging.warning(f"Error getting headers for {url}: {e}{hint}")
                     headers = CaseInsensitiveDict()
 
                 content_type = headers.get("Content-Type", "").lower()
@@ -153,20 +186,19 @@ class BaseCrawler(ABC):
 
                 if temp_file_suffix:
                     try:
-                        response = requests.get(url)
+                        content, _ = fetch_configured_url(url, config)
                         with NamedTemporaryFile(
                             delete=False, suffix=temp_file_suffix
                         ) as temp_file:
-                            temp_file.write(response.content)
+                            temp_file.write(content)
                             temp_file_path = temp_file.name
-                        doc_parser = DocumentParser.create(
-                            temp_file_path, self.parser.config
-                        )
+                        doc_parser = DocumentParser.create(temp_file_path, config)
                         docs = doc_parser.get_doc_chunks()
                         os.remove(temp_file_path)
                         return docs
                     except Exception as e:
-                        logging.error(f"Error downloading/parsing {url}: {e}")
+                        hint = _limit_hint(e, config)
+                        logging.error(f"Error downloading/parsing {url}: {e}{hint}")
                         return []
         return []
 

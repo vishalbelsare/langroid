@@ -15,15 +15,30 @@ pip install "langroid[hf-embeddings]"
 """
 
 import asyncio
+import copy
 import importlib
 import logging
+import math
+import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import cache
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, no_type_check
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    no_type_check,
+)
 
 import nest_asyncio
 import numpy as np
 import pandas as pd
+from pydantic import Field
 from rich.prompt import Prompt
 
 from langroid.agent.batch import run_batch_agent_method, run_batch_tasks
@@ -39,7 +54,7 @@ from langroid.embedding_models.models import (
     OpenAIEmbeddingsConfig,
     SentenceTransformerEmbeddingsConfig,
 )
-from langroid.language_models.base import StreamingIfAllowed
+from langroid.language_models.base import LLMConfig, StreamingIfAllowed
 from langroid.language_models.openai_gpt import OpenAIChatModel, OpenAIGPTConfig
 from langroid.mytypes import DocMetaData, Document, Entity
 from langroid.parsing.document_parser import DocumentType
@@ -66,6 +81,9 @@ from langroid.utils.pydantic_utils import dataframe_to_documents, extract_fields
 from langroid.vector_store.base import VectorStore, VectorStoreConfig
 from langroid.vector_store.qdrantdb import QdrantDBConfig
 
+if TYPE_CHECKING:
+    from sentence_transformers import CrossEncoder
+
 
 @cache
 def apply_nest_asyncio() -> None:
@@ -73,6 +91,101 @@ def apply_nest_asyncio() -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_finite_float(value: Any) -> Optional[float]:
+    """Coerce an arbitrary runtime value to a finite float, if possible.
+
+    Args:
+        value (Any): A value expected to be numeric (e.g. a retrieval
+            score or threshold), but which at runtime may be None or
+            oddly-shaped (non-numeric, or NaN/infinite).
+
+    Returns:
+        Optional[float]: The value as a finite float, or None if it
+            cannot be coerced to one.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def _finite_positive_threshold(value: Any) -> Optional[float]:
+    """Normalize a runtime score-threshold value to an "active" filter value.
+
+    Args:
+        value (Any): The raw threshold read off a config object at runtime;
+            it may be absent/None or an oddly-shaped (non-numeric,
+            non-finite) value that never went through pydantic validation.
+
+    Returns:
+        Optional[float]: The threshold as a finite float strictly greater
+            than 0.0 if `value` coerces to one, else None, meaning the
+            score filter is INACTIVE (invalid, `None`, `NaN`, infinite,
+            zero, and negative values all deactivate the filter).
+    """
+    threshold = _coerce_finite_float(value)
+    if threshold is None or threshold <= 0.0:
+        return None
+    return threshold
+
+
+@dataclass
+class _CrossEncoderCacheEntry:
+    model: "CrossEncoder"
+    lock: threading.RLock
+
+
+_CROSS_ENCODER_CACHE: Dict[str, _CrossEncoderCacheEntry] = {}
+_CROSS_ENCODER_CACHE_LOCK = threading.Lock()
+
+
+def _auto_cross_encoder_device() -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _get_cross_encoder_entry(
+    model_name: str, device: str | None
+) -> _CrossEncoderCacheEntry:
+    actual_device = device or _auto_cross_encoder_device()
+    cache_key = f"{model_name}::{actual_device}"
+    entry = _CROSS_ENCODER_CACHE.get(cache_key)
+    if entry is not None:
+        return entry
+
+    with _CROSS_ENCODER_CACHE_LOCK:
+        entry = _CROSS_ENCODER_CACHE.get(cache_key)
+        if entry is not None:
+            return entry
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as exc:
+            raise ImportError(
+                """
+                To use cross-encoder re-ranking, you must install
+                langroid with the [hf-embeddings] extra, e.g.:
+                pip install "langroid[hf-embeddings]"
+                """
+            ) from exc
+
+        model = CrossEncoder(model_name, device=actual_device)
+        entry = _CrossEncoderCacheEntry(model=model, lock=threading.RLock())
+        _CROSS_ENCODER_CACHE[cache_key] = entry
+        return entry
 
 
 DEFAULT_DOC_CHAT_SYSTEM_MESSAGE = """
@@ -150,10 +263,37 @@ class DocChatAgentConfig(ChatAgentConfig):
     n_fuzzy_neighbor_words: int = 100  # num neighbor words to retrieve for fuzzy match
     use_fuzzy_match: bool = True
     use_bm25_search: bool = True
+    bm25_score_threshold: float = Field(
+        default=0.0,
+        description="""
+        Keep a BM25-retrieved chunk only if its BM25 score satisfies
+        `score >= bm25_score_threshold`. The filter is applied only when
+        this threshold is > 0.0; the default 0.0 means no filtering.
+        Values that are not finite positive numbers (e.g. None, NaN,
+        +/-inf, negatives) also deactivate the filter at runtime.
+        NOTE: BM25 scores are unbounded and corpus-dependent (they vary
+        with document/corpus statistics), so no single value is right
+        for every collection; this is an expert opt-in knob to tune
+        per corpus.
+        """,
+    )
+    fuzzy_score_threshold: float = Field(
+        default=50.0,
+        description="""
+        Keep a fuzzy match only if its score satisfies
+        `score > fuzzy_score_threshold` (strictly greater), on the 0-100
+        `rapidfuzz` scale (100 = perfect match). The default 50.0
+        preserves the long-standing behavior of dropping matches with
+        score <= 50; lower it to admit weaker matches, or raise it to
+        keep only stronger ones. A value that is not a finite number
+        (e.g. None, NaN, +/-inf) yields NO fuzzy matches at runtime.
+        """,
+    )
     use_reciprocal_rank_fusion: bool = False
     cross_encoder_reranking_model: str = (  # ignored if use_reciprocal_rank_fusion=True
         "cross-encoder/ms-marco-MiniLM-L-6-v2" if has_sentence_transformers else ""
     )
+    cross_encoder_device: Optional[str] = None  # default to CPU when None
     rerank_diversity: bool = True  # rerank to maximize diversity?
     rerank_periphery: bool = True  # rerank to avoid Lost In the Middle effect?
     rerank_after_adding_context: bool = True  # rerank after adding context window?
@@ -195,8 +335,10 @@ class DocChatAgentConfig(ChatAgentConfig):
             # NOTE: PDF parsing is extremely challenging, and each library
             # has its own strengths and weaknesses.
             # Try one that works for your use case.
-            # or "unstructured", "fitz", "pymupdf4llm", "pypdf"
-            library="pymupdf4llm",
+            # `pypdfium2` is the permissive default and is installed by default;
+            # the others (e.g. "unstructured", "fitz", "pymupdf4llm", "docling",
+            # "pypdf") require installing an extra such as `doc-chat`.
+            library="pypdfium2",
         ),
     )
     crawler_config: Optional[BaseCrawlerConfig] = TrafilaturaConfig()
@@ -209,7 +351,7 @@ class DocChatAgentConfig(ChatAgentConfig):
         embedding=hf_embed_config if has_sentence_transformers else oai_embed_config,
     )
 
-    llm: OpenAIGPTConfig = OpenAIGPTConfig(
+    llm: LLMConfig = OpenAIGPTConfig(
         type="openai",
         chat_model=OpenAIChatModel.GPT4o,
         completion_model=OpenAIChatModel.GPT4o,
@@ -220,10 +362,27 @@ class DocChatAgentConfig(ChatAgentConfig):
     )
 
 
-def _append_metadata_source(orig_source: str, source: str) -> str:
-    if orig_source != source and source != "" and orig_source != "":
-        return f"{orig_source.strip()}; {source.strip()}"
-    return orig_source.strip() + source.strip()
+def _append_metadata_source(orig_source: object, source: object) -> str:
+    """Append a source unless it is already in the ``; ``-delimited list.
+
+    Leading and trailing whitespace is ignored for both empty-value and
+    duplicate checks, including around entries in the existing source list.
+    The ``; `` sequence is structural and is interpreted as a list boundary;
+    plain semicolons remain part of a source value.
+
+    Args:
+        orig_source: Existing source or source list. Non-strings are empty.
+        source: Source to append. Non-string values are treated as empty.
+
+    Returns:
+        The trimmed existing sources, optionally followed by the new source.
+    """
+    orig = orig_source.strip() if isinstance(orig_source, str) else ""
+    src = source.strip() if isinstance(source, str) else ""
+    if orig and src:
+        sources = (item.strip() for item in orig.split("; "))
+        return orig if orig == src or src in sources else f"{orig}; {src}"
+    return orig or src
 
 
 class DocChatAgent(ChatAgent):
@@ -298,6 +457,19 @@ class DocChatAgent(ChatAgent):
             self.config.n_relevant_chunks = self.config.parsing.n_similar_docs
 
         self.ingest()
+
+    def _clone_extra_state(self, new_agent: "ChatAgent") -> None:
+        super()._clone_extra_state(new_agent)
+        for attr in [
+            "chunked_docs",
+            "chunked_docs_clean",
+            "original_docs",
+            "original_docs_length",
+            "from_dataframe",
+            "df_description",
+        ]:
+            if hasattr(self, attr):
+                setattr(new_agent, attr, copy.deepcopy(getattr(self, attr)))
 
     def clear(self) -> None:
         """Clear the document collection and the specific collection in vecdb"""
@@ -1093,6 +1265,11 @@ class DocChatAgent(ChatAgent):
                 k=self.config.n_similar_chunks * multiple,
                 words_before=self.config.n_fuzzy_neighbor_words or None,
                 words_after=self.config.n_fuzzy_neighbor_words or None,
+                # tolerate a config lacking the field (e.g. deserialized
+                # from an older version); 50.0 is the legacy default.
+                # Invalid/non-finite values are handled (=> no matches)
+                # inside find_fuzzy_matches_in_docs itself.
+                score_threshold=getattr(self.config, "fuzzy_score_threshold", 50.0),
             )
         return fuzzy_match_docs
 
@@ -1100,19 +1277,13 @@ class DocChatAgent(ChatAgent):
         self, query: str, passages: List[Document]
     ) -> List[Document]:
         with status("[cyan]Re-ranking retrieved chunks using cross-encoder..."):
-            try:
-                from sentence_transformers import CrossEncoder
-            except ImportError:
-                raise ImportError(
-                    """
-                    To use cross-encoder re-ranking, you must install
-                    langroid with the [hf-embeddings] extra, e.g.:
-                    pip install "langroid[hf-embeddings]"
-                    """
-                )
-
-            model = CrossEncoder(self.config.cross_encoder_reranking_model)
-            scores = model.predict([(query, p.content) for p in passages])
+            device = self.config.cross_encoder_device
+            entry = _get_cross_encoder_entry(
+                self.config.cross_encoder_reranking_model, device
+            )
+            pair_inputs = [(query, p.content) for p in passages]
+            with entry.lock:
+                scores = entry.model.predict(pair_inputs, show_progress_bar=False)
             # Convert to [0,1] so we might could use a cutoff later.
             scores = 1.0 / (1 + np.exp(-np.array(scores)))
             # get top k scoring passages
@@ -1325,8 +1496,32 @@ class DocChatAgent(ChatAgent):
 
         id2_rank_bm25 = {}
         if self.config.use_bm25_search:
-            # TODO: Add score threshold in config
             docs_scores = self.get_similar_chunks_bm25(query, retrieval_multiple)
+            # Read the threshold defensively: tolerate absent/None or
+            # oddly-shaped runtime values by treating them as "no filtering".
+            bm25_threshold = _finite_positive_threshold(
+                getattr(self.config, "bm25_score_threshold", None)
+            )
+            if bm25_threshold is not None:
+                # Compare defensively: a runtime BM25/FTS backend may
+                # return scores that are None or otherwise non-orderable,
+                # so coerce each score first and drop pairs lacking a
+                # finite numeric score, rather than crash on `>=`.
+                filtered_docs_scores: List[Tuple[Document, float]] = []
+                for d, s in docs_scores:
+                    score = _coerce_finite_float(s)
+                    if score is not None and score >= bm25_threshold:
+                        filtered_docs_scores.append((d, score))
+                docs_scores = filtered_docs_scores
+            elif self.config.use_reciprocal_rank_fusion:
+                # RRF always ranks BM25 pairs by score, so even when the
+                # threshold is inactive, normalize scores before sorting
+                # mixed raw values. Unrankable scores sort as 0.0.
+                normalized_docs_scores: List[Tuple[Document, float]] = []
+                for d, s in docs_scores:
+                    score = _coerce_finite_float(s)
+                    normalized_docs_scores.append((d, 0.0 if score is None else score))
+                docs_scores = normalized_docs_scores
             id2doc.update({d.id(): d for d, _ in docs_scores})
             if self.config.use_reciprocal_rank_fusion:
                 # if we're not re-ranking with a cross-encoder, and have RRF enabled,
@@ -1341,7 +1536,6 @@ class DocChatAgent(ChatAgent):
 
         id2_rank_fuzzy = {}
         if self.config.use_fuzzy_match:
-            # TODO: Add score threshold in config
             fuzzy_match_doc_scores = self.get_fuzzy_matches(query, retrieval_multiple)
             if self.config.use_reciprocal_rank_fusion:
                 # if we're not re-ranking with a cross-encoder,
@@ -1468,11 +1662,17 @@ class DocChatAgent(ChatAgent):
             List[Document]: list of relevant extracts
 
         """
-        if (
-            self.vecdb is None
-            or self.vecdb.config.collection_name
-            not in self.vecdb.list_collections(empty=False)
-        ):
+        collection_name = (
+            None if self.vecdb is None else self.vecdb.config.collection_name
+        )
+        has_vecdb_collection = (
+            collection_name is not None
+            and collection_name in self.vecdb.list_collections(empty=False)
+            if self.vecdb is not None
+            else False
+        )
+
+        if not has_vecdb_collection and len(self.chunked_docs) == 0:
             return query, []
 
         if len(self.dialog) > 0 and not self.config.assistant_mode:
@@ -1492,16 +1692,22 @@ class DocChatAgent(ChatAgent):
         if self.config.n_query_rephrases > 0:
             rephrases = self.llm_rephrase_query(query)
             proxies += rephrases
-        passages = self.get_relevant_chunks(query, proxies)  # no LLM involved
+        if has_vecdb_collection:
+            passages = self.get_relevant_chunks(query, proxies)  # no LLM involved
+        else:
+            passages = self.chunked_docs
 
         if len(passages) == 0:
             return query, []
 
-        with status("[cyan]LLM Extracting verbatim passages..."):
-            with StreamingIfAllowed(self.llm, False):
-                # these are async calls, one per passage; turn off streaming
-                extracts = self.get_verbatim_extracts(query, passages)
-                extracts = [e for e in extracts if e.content != NO_ANSWER]
+        if self.config.relevance_extractor_config is None:
+            extracts = passages
+        else:
+            with status("[cyan]LLM Extracting verbatim passages..."):
+                with StreamingIfAllowed(self.llm, False):
+                    # these are async calls, one per passage; turn off streaming
+                    extracts = self.get_verbatim_extracts(query, passages)
+                    extracts = [e for e in extracts if e.content != NO_ANSWER]
 
         return query, extracts
 

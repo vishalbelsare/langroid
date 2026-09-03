@@ -1,11 +1,17 @@
 import copy
 import logging
+import re
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import numpy as np
 import pandas as pd
-from pydantic_settings import BaseSettings
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from langroid.embedding_models.base import EmbeddingModel, EmbeddingModelsConfig
 from langroid.embedding_models.models import OpenAIEmbeddingsConfig
@@ -14,13 +20,61 @@ from langroid.utils.algorithms.graph import components, topological_sort
 from langroid.utils.configuration import settings
 from langroid.utils.object_registry import ObjectRegistry
 from langroid.utils.output.printing import print_long_text
-from langroid.utils.pandas_utils import sanitize_command, stringify
+from langroid.utils.pandas_utils import safe_eval_globals, sanitize_command, stringify
 from langroid.utils.pydantic_utils import flatten_dict
 
 logger = logging.getLogger(__name__)
 
+# the exact shape Kubernetes service links inject, e.g. tcp://10.0.0.8:6333
+# (\Z, not $: $ would match before a trailing newline, silently
+# discarding a value that should fail validation)
+_SERVICE_LINK_PORT_RE = re.compile(r"^tcp://\S+:\d+\Z")
+
+
+class _ServiceLinkPortFilter(PydanticBaseSettingsSource):
+    """Env-source wrapper dropping k8s/docker service-link `port` values.
+
+    With `enableServiceLinks` (on by default in Kubernetes), a service
+    named e.g. `qdrant` injects `QDRANT_PORT=tcp://IP:PORT` into every
+    pod, which would otherwise fail integer validation of the `port`
+    field. If the wrapped env source yields a `port` string matching
+    exactly that format, it is dropped (with a warning) so the class
+    default applies. Any other value — including malformed `tcp://`
+    junk, or a `tcp://` value passed to the constructor (which never
+    goes through this source) — still fails validation as usual.
+    """
+
+    def __init__(self, wrapped: PydanticBaseSettingsSource) -> None:
+        super().__init__(wrapped.settings_cls)
+        self._wrapped = wrapped
+
+    def get_field_value(
+        self, field: FieldInfo, field_name: str
+    ) -> Tuple[Any, str, bool]:
+        return self._wrapped.get_field_value(field, field_name)
+
+    def __call__(self) -> Dict[str, Any]:
+        values = self._wrapped()
+        port = values.get("port")
+        if isinstance(port, str) and _SERVICE_LINK_PORT_RE.match(port):
+            default = self.settings_cls.model_fields["port"].default
+            logger.warning(
+                f"Ignoring port value {port!r} from the environment: it "
+                f"looks like a Kubernetes/Docker service-link artifact "
+                f"(an injected <SERVICE>_PORT env var); using default "
+                f"port {default} instead."
+            )
+            values = {k: v for k, v in values.items() if k != "port"}
+        return values
+
 
 class VectorStoreConfig(BaseSettings):
+    # Without a prefix, every field name would itself be a
+    # case-insensitive env var (e.g. a bare HOST, PORT, or FULL_EVAL
+    # in the environment would silently override defaults); subclasses
+    # each set their own prefix (QDRANT_, LANCEDB_, ...).
+    model_config = SettingsConfigDict(env_prefix="VECDB_")
+
     type: str = ""  # deprecated, keeping it for backward compatibility
     collection_name: str | None = "temp"
     replace_collection: bool = False  # replace collection if it already exists
@@ -40,6 +94,27 @@ class VectorStoreConfig(BaseSettings):
     # compose_file: str = "langroid/vector_store/docker-compose-qdrant.yml"
     full_eval: bool = False  # runs eval without sanitization. Use only on trusted input
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        """Wrap the env source to drop k8s service-link `port` values.
+
+        Source precedence is unchanged (init beats env, etc.); only the
+        env source is filtered — see `_ServiceLinkPortFilter`.
+        """
+        return (
+            init_settings,
+            _ServiceLinkPortFilter(env_settings),
+            dotenv_settings,
+            file_secret_settings,
+        )
+
 
 class VectorStore(ABC):
     """
@@ -52,6 +127,8 @@ class VectorStore(ABC):
             self.embedding_model = EmbeddingModel.create(config.embedding)
         else:
             self.embedding_model = config.embedding_model
+        if hasattr(self.config, "embedding_model"):
+            self.config.embedding_model = None
         self.embedding_fn: EmbeddingFunction = self.embedding_model.embedding_fn()
 
     @staticmethod
@@ -59,6 +136,7 @@ class VectorStore(ABC):
         from langroid.vector_store.chromadb import ChromaDB, ChromaDBConfig
         from langroid.vector_store.lancedb import LanceDB, LanceDBConfig
         from langroid.vector_store.meilisearch import MeiliSearch, MeiliSearchConfig
+        from langroid.vector_store.milvusdb import MilvusDB, MilvusDBConfig
         from langroid.vector_store.pineconedb import PineconeDB, PineconeDBConfig
         from langroid.vector_store.postgres import PostgresDB, PostgresDBConfig
         from langroid.vector_store.qdrantdb import QdrantDB, QdrantDBConfig
@@ -74,6 +152,8 @@ class VectorStore(ABC):
             return MeiliSearch(config)
         elif isinstance(config, PostgresDBConfig):
             return PostgresDB(config)
+        elif isinstance(config, MilvusDBConfig):
+            return MilvusDB(config)
         elif isinstance(config, WeaviateDBConfig):
             return WeaviateDB(config)
         elif isinstance(config, PineconeDBConfig):
@@ -104,19 +184,38 @@ class VectorStore(ABC):
         (e.g., embedded/local stores that rely on file locks).
         """
 
-        config_copy = self.config.model_copy(deep=True)
+        config_class = self.config.__class__
+        config_data = self.config.model_dump(mode="python")
+        config_data["embedding_model"] = None
+        config_copy = config_class.model_validate(config_data)
+        logger.debug(
+            "Cloning VectorStore %s: original collection=%s, copied collection=%s",
+            type(self).__name__,
+            getattr(self.config, "collection_name", None),
+            getattr(config_copy, "collection_name", None),
+        )
         # Preserve the calculated collection contents without forcing replaces
         if hasattr(config_copy, "replace_collection"):
             config_copy.replace_collection = False  # type: ignore[attr-defined]
-        if hasattr(config_copy, "embedding_model"):
-            config_copy.embedding_model = getattr(self.config, "embedding_model", None)
-        # Fall back to the existing embedding model instance if config lacks it
-        if getattr(config_copy, "embedding_model", None) is None:
-            setattr(
-                config_copy, "embedding_model", getattr(self, "embedding_model", None)
-            )
+        cloned_embedding: Optional[EmbeddingModel] = None
+        if (
+            hasattr(self, "embedding_model")
+            and getattr(self, "embedding_model") is not None
+        ):
+            cloned_embedding = self.embedding_model.clone()  # type: ignore[attr-defined]
+            if hasattr(config_copy, "embedding_model"):
+                config_copy.embedding_model = cloned_embedding
 
         cloned_store = type(self)(config_copy)  # type: ignore[call-arg]
+        if hasattr(cloned_store.config, "embedding_model"):
+            cloned_store.config.embedding_model = None
+        logger.debug(
+            "Cloned VectorStore %s: cloned collection=%s",
+            type(self).__name__,
+            getattr(cloned_store.config, "collection_name", None),
+        )
+        if hasattr(cloned_store.config, "replace_collection"):
+            cloned_store.config.replace_collection = False
         # Some stores might not honour replace_collection; ensure same collection
         if getattr(self.config, "collection_name", None) is not None:
             setattr(
@@ -196,12 +295,16 @@ class VectorStore(ABC):
 
         try:
             # SECURITY MITIGATION: Eval input is sanitized to prevent most common
-            # code injection attack vectors when full_eval is False.
+            # code injection attack vectors when full_eval is False. The globals
+            # dict also restricts ``__builtins__`` so that even with
+            # ``full_eval=True`` the expression cannot reach
+            # ``__import__``/``eval``/``exec`` via Python's implicit builtin
+            # injection (GHSA-q9p7-wqxg-mrhc).
             vars = {"df": df}
             if not self.config.full_eval:
                 calc = sanitize_command(calc)
             code = compile(calc, "<calc>", "eval")
-            result = eval(code, vars, {})
+            result = eval(code, safe_eval_globals(vars), {})
         except Exception as e:
             # return error message so LLM can fix the calc string if needed
             err = f"""

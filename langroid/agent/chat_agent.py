@@ -1,11 +1,25 @@
+import base64
 import copy
 import inspect
 import json
 import logging
+import math
 import textwrap
 from contextlib import ExitStack
 from inspect import isclass
-from typing import Any, Dict, List, Optional, Self, Set, Tuple, Type, Union, cast
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Self,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 import openai
 from pydantic import BaseModel, ValidationError
@@ -14,7 +28,13 @@ from rich import print
 from rich.console import Console
 from rich.markup import escape
 
-from langroid.agent.base import Agent, AgentConfig, async_noop_fn, noop_fn
+from langroid.agent.base import (
+    Agent,
+    AgentConfig,
+    SearchForTools,
+    async_noop_fn,
+    noop_fn,
+)
 from langroid.agent.chat_document import ChatDocument
 from langroid.agent.tool_message import (
     ToolMessage,
@@ -34,6 +54,7 @@ from langroid.language_models.base import (
 )
 from langroid.language_models.openai_gpt import OpenAIGPT
 from langroid.mytypes import Entity, NonToolAction
+from langroid.parsing.file_attachment import FileAttachment
 from langroid.utils.configuration import settings
 from langroid.utils.object_registry import ObjectRegistry
 from langroid.utils.output import status
@@ -43,6 +64,51 @@ from langroid.utils.types import is_callable
 console = Console()
 
 logger = logging.getLogger(__name__)
+
+# Stable origin sentinel for the dynamically generated strict-recovery AnyTool
+# class ("tool_or_function"): a fresh class is built per call (its tool-union
+# type varies), so re-registration must be recognized as the same logical tool.
+_ANY_TOOL_MESSAGE_ORIGIN: Any = object()
+
+# Safety margin (in tokens) subtracted from the model context length when
+# shrinking chat history and/or the requested output length to fit, in case
+# our token-count estimates are off.
+CHAT_HISTORY_BUFFER = 300
+
+
+def _reject_json_constant(constant: str) -> None:
+    """Reject JavaScript numeric constants that are not valid JSON."""
+    raise ValueError(f"non-JSON numeric constant: {constant}")
+
+
+def _parse_json_float(value: str) -> float:
+    """Parse a JSON float while rejecting exponent overflow."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
+def _is_identified_result(message: LLMMessage) -> bool:
+    """Whether a TOOL/FUNCTION result has its identifier and no call payload.
+
+    Such results must survive even with empty content so their calls can be
+    marked complete (issue #1063).
+    """
+    has_identifier = (
+        message.role == Role.TOOL and bool((message.tool_call_id or "").strip())
+    ) or (message.role == Role.FUNCTION and bool((message.name or "").strip()))
+    return has_identifier and message.function_call is None and not message.tool_calls
+
+
+def _llm_message_has_payload(message: LLMMessage) -> bool:
+    """Whether a message has the fields required for a valid history entry."""
+    return (
+        (message.content or "").strip() != ""
+        or message.function_call is not None
+        or bool(message.tool_calls)
+        or _is_identified_result(message)
+    )
 
 
 class ChatAgentConfig(AgentConfig):
@@ -88,6 +154,25 @@ class ChatAgentConfig(AgentConfig):
             in the output schema
         full_citations: Whether to show source reference citation + content for each
             citation, or just the main reference citation.
+        search_for_tools_everywhere: Whether to search for tools everywhere,
+            or only in specific LLM response elements based on use_tools /
+            use_functions_api / use_tools_api config settings.
+        recognize_recipient_in_content: Whether to parse LLM response text content
+            for recipient routing patterns, specifically:
+            - ``TO[<recipient>]:<content>`` addressing format, and
+            - JSON ``{"recipient": "<name>"}`` at the top level of the message.
+            When False, only structured routing via function_call/tool_call
+            ``recipient`` fields is recognized. Default is True.
+            Note: this is distinct from ``TaskConfig.recognize_string_signals``,
+            which controls Task-level signals like DONE, PASS, and SEND_TO.
+            To fully disable all text-based routing, set both to False.
+        context_overflow_strategy: Strategy for handling context overflow when
+            message history exceeds model context length. Options:
+            - "truncate": Truncate content of early messages (preserves all messages
+              but with shortened content). This maintains the message sequence.
+            - "drop_turns": Drop complete conversation turns (USER + all responses
+              until next USER). More aggressive but cleaner for voice agents.
+            Default is "truncate" for backward compatibility.
     """
 
     system_message: str = "You are a helpful assistant."
@@ -105,6 +190,9 @@ class ChatAgentConfig(AgentConfig):
     output_format_include_defaults: bool = True
     use_tools_on_output_format: bool = True
     full_citations: bool = True  # show source + content for each citation?
+    search_for_tools_everywhere: bool = True
+    recognize_recipient_in_content: bool = True
+    context_overflow_strategy: Literal["truncate", "drop_turns"] = "truncate"
 
     def _set_fn_or_tools(self) -> None:
         """
@@ -155,6 +243,8 @@ class ChatAgent(Agent):
         self.config: ChatAgentConfig = config
         self.config._set_fn_or_tools()
         self.message_history: List[LLMMessage] = []
+        # emit the attachment-token-estimate warning at most once per agent
+        self._attachment_tokens_warned: bool = False
         self.init_state()
         # An agent's "task" is defined by a system msg and an optional user msg;
         # These are "priming" messages that kick off the agent's conversation.
@@ -164,7 +254,7 @@ class ChatAgent(Agent):
         if task is not None:
             # if task contains a system msg, we override the config system msg
             if len(task) > 0 and task[0].role == Role.SYSTEM:
-                self.system_message = task[0].content
+                self.system_message = task[0].content or ""
             # if task contains a user msg, we override the config user msg
             if len(task) > 1 and task[1].role == Role.USER:
                 self.user_message = task[1].content
@@ -208,6 +298,16 @@ class ChatAgent(Agent):
         self.any_strict = False
         # Tracks the set of tools on which we force-disable strict decoding
         self.disable_strict_tools_set: set[str] = set()
+
+        # search for tools according to the agent configuration
+        if not config.search_for_tools_everywhere:
+            if config.use_functions_api:
+                if config.use_tools_api:
+                    self.search_for_tools = {SearchForTools.TOOLS.value}
+                else:
+                    self.search_for_tools = {SearchForTools.FUNCTIONS.value}
+            else:
+                self.search_for_tools = {SearchForTools.CONTENT.value}
 
         if self.config.enable_orchestration_tool_handling:
             # Only enable HANDLING by `agent_response`, NOT LLM generation of these.
@@ -281,10 +381,14 @@ class ChatAgent(Agent):
         new_agent.llm_function_force = self.llm_function_force
         # Ensure each clone gets its own vecdb client when supported.
         new_agent.vecdb = None if self.vecdb is None else self.vecdb.clone()
+        self._clone_extra_state(new_agent)
         new_agent.id = ObjectRegistry.new_id()
         if self.config.add_to_registry:
             ObjectRegistry.register_object(new_agent)
         return new_agent
+
+    def _clone_extra_state(self, new_agent: "ChatAgent") -> None:
+        """Hook for subclasses to copy additional state into clones."""
 
     def _strict_mode_for_tool(self, tool: str | type[ToolMessage]) -> bool:
         """Should we enable strict mode for a given tool?"""
@@ -401,6 +505,183 @@ class ChatAgent(Agent):
                 LLMMessage(role=Role.ASSISTANT, content=response),
             ]
         )
+
+    def export_history(self) -> str:
+        """Export message history as a portable, versioned JSON snapshot.
+
+        Returns:
+            A JSON string containing the current message history.
+        """
+        messages: List[Dict[str, Any]] = []
+        for message in self.message_history:
+            json.dumps(
+                message.model_dump(mode="python", exclude={"files"}),
+                allow_nan=False,
+                default=str,
+            )
+            data = message.model_dump(mode="json", exclude={"files"})
+            data["chat_document_id"] = ""
+            data["files"] = [
+                {
+                    "content_base64": base64.b64encode(file.content).decode("ascii"),
+                    "filename": file.filename,
+                    "mime_type": file.mime_type,
+                    "url": file.url,
+                    "detail": file.detail,
+                }
+                for file in message.files
+            ]
+            messages.append(data)
+        return json.dumps({"version": 1, "messages": messages}, allow_nan=False)
+
+    def import_history(
+        self,
+        snapshot: str,
+        max_size_bytes: int = 100 * 1024 * 1024,
+    ) -> None:
+        """Restore message history from :meth:`export_history` output.
+
+        Args:
+            snapshot: Versioned JSON snapshot to restore.
+            max_size_bytes: Maximum total decoded attachment size. Defaults to
+                100 MiB.
+
+        Raises:
+            ValueError: If the snapshot is malformed, has an unknown version,
+                starts with a non-system message, or exceeds ``max_size_bytes``.
+        """
+        try:
+            if max_size_bytes < 0:
+                raise ValueError("max_size_bytes must be non-negative")
+            payload = json.loads(
+                snapshot,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_json_float,
+            )
+            if (
+                not isinstance(payload, dict)
+                or type(payload.get("version")) is not int
+                or payload["version"] != 1
+            ):
+                raise ValueError("unsupported version")
+            raw_messages = payload.get("messages")
+            if not isinstance(raw_messages, list):
+                raise ValueError("messages must be a list")
+            if not raw_messages:
+                raise ValueError("messages must not be empty")
+
+            messages: List[LLMMessage] = []
+            total_attachment_bytes = 0
+            for raw_message in raw_messages:
+                if not isinstance(raw_message, dict):
+                    raise ValueError("message must be an object")
+                message_data = dict(raw_message)
+                raw_files = message_data.get("files", [])
+                if not isinstance(raw_files, list):
+                    raise ValueError("files must be a list")
+                files = []
+                for raw_file in raw_files:
+                    if not isinstance(raw_file, dict):
+                        raise ValueError("file must be an object")
+                    file_data = dict(raw_file)
+                    encoded_content = file_data.pop("content_base64")
+                    if not isinstance(encoded_content, str):
+                        raise ValueError("content_base64 must be a string")
+                    encoded_bytes = encoded_content.encode("ascii")
+                    padding = len(encoded_bytes) - len(encoded_bytes.rstrip(b"="))
+                    decoded_size = max(
+                        0,
+                        len(encoded_bytes) // 4 * 3 - min(padding, 2),
+                    )
+                    if total_attachment_bytes + decoded_size > max_size_bytes:
+                        raise ValueError(
+                            "decoded attachments exceed "
+                            f"max_size_bytes={max_size_bytes}"
+                        )
+                    content = base64.b64decode(encoded_bytes, validate=True)
+                    total_attachment_bytes += len(content)
+                    if total_attachment_bytes > max_size_bytes:
+                        raise ValueError(
+                            "decoded attachments exceed "
+                            f"max_size_bytes={max_size_bytes}"
+                        )
+                    files.append(FileAttachment(content=content, **file_data))
+                message_data["files"] = files
+                message_data["chat_document_id"] = ""
+                messages.append(LLMMessage.model_validate(message_data))
+            if messages[0].role != Role.SYSTEM:
+                raise ValueError("first message must have role 'system'")
+            seen_call_ids: Set[str] = set()
+            for message in messages:
+                if message.role in (Role.TOOL, Role.FUNCTION) and (
+                    message.function_call is not None or message.tool_calls is not None
+                ):
+                    raise ValueError("result messages must not contain call payloads")
+                if message.function_call is not None and message.role != Role.ASSISTANT:
+                    raise ValueError("function calls must have role 'assistant'")
+                if message.function_call is not None:
+                    if not message.function_call.name.strip():
+                        raise ValueError("function call names must be nonblank")
+                if message.tool_call_id is not None and message.role != Role.TOOL:
+                    raise ValueError("tool_call_id is only valid on tool results")
+                if message.role == Role.FUNCTION:
+                    name = message.name
+                    if name is None or not name or name != name.strip():
+                        raise ValueError(
+                            "function result name must be nonblank and normalized"
+                        )
+                if message.tool_calls is not None:
+                    if message.role != Role.ASSISTANT:
+                        raise ValueError("tool calls must have role 'assistant'")
+                    for call in message.tool_calls:
+                        if call.function is None:
+                            raise ValueError("tool calls must include a function")
+                        if not call.function.name.strip():
+                            raise ValueError("function call names must be nonblank")
+                        call_id = call.id
+                        if call_id is None or not call_id or call_id != call_id.strip():
+                            raise ValueError(
+                                "tool call IDs must be nonblank and normalized"
+                            )
+                        if call_id in seen_call_ids:
+                            raise ValueError("tool call IDs must be unique")
+                        seen_call_ids.add(call_id)
+                    if not message.tool_calls:
+                        message.tool_calls = None
+        except (
+            KeyError,
+            RecursionError,
+            TypeError,
+            UnicodeEncodeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(f"Invalid history snapshot: {exc}") from exc
+
+        all_calls = {
+            call.id: call
+            for message in messages
+            for call in (message.tool_calls or [])
+            if call.id is not None
+        }
+        completed_call_ids = {
+            message.tool_call_id
+            for message in messages
+            if message.role == Role.TOOL and message.tool_call_id is not None
+        }
+        old_chat_document_ids = {
+            message.chat_document_id
+            for message in self.message_history
+            if message.chat_document_id
+        }
+        for chat_document_id in old_chat_document_ids:
+            ChatDocument.delete_id(chat_document_id)
+        self.message_history = messages
+        self.oai_tool_id2call = all_calls
+        self.oai_tool_calls = [
+            call
+            for call_id, call in all_calls.items()
+            if call_id not in completed_call_ids
+        ]
 
     def tool_format_rules(self) -> str:
         """
@@ -631,7 +912,14 @@ class ChatAgent(Agent):
                 case NonToolAction.FORWARD_USER:
                     return ForwardTool(agent="User")
                 case NonToolAction.DONE:
-                    return AgentDoneTool(content=msg.content, tools=msg.tool_messages)
+                    done_tool = AgentDoneTool(
+                        content=msg.content, tools=msg.tool_messages
+                    )
+                    # Carry taint on this content+tools repackage, exactly as
+                    # DonePassTool does: msg may be a tainted doc re-emitted
+                    # with sender relabeled to LLM (#1035).
+                    done_tool._tainted = msg.metadata.tainted
+                    return done_tool
         elif is_callable(no_tool_option):
             return no_tool_option(msg)
         # Otherwise just return `no_tool_option` as is:
@@ -693,8 +981,49 @@ class ChatAgent(Agent):
                     include_defaults=include_defaults,
                 )
             return None
+
+        # Validate that use/handle are booleans, not accidentally passed tool classes
+        if isclass(use) or isclass(handle):
+            param = "use" if isclass(use) else "handle"
+            raise TypeError(
+                textwrap.dedent(
+                    f"""
+                    Invalid arguments to enable_message().
+                    It appears you passed multiple ToolMessage classes as separate
+                    arguments instead of as a list.
+
+                    Correct usage:
+                        agent.enable_message([Tool1, Tool2, Tool3])
+
+                    Incorrect usage:
+                        agent.enable_message(Tool1, Tool2, Tool3)
+
+                    The '{param}' parameter must be a boolean, not a class.
+                    """
+                )
+            )
+
         if require_recipient and message_class is not None:
             message_class = message_class.require_recipient()
+        if message_class is not None:
+            if not issubclass(message_class, ToolMessage):
+                raise ValueError("message_class must be a subclass of ToolMessage")
+            request = message_class.default_value("request")
+            existing_class = self.llm_tools_map.get(request)
+            existing_origin = (
+                existing_class.__dict__.get("__tool_message_origin__", existing_class)
+                if existing_class is not None
+                else None
+            )
+            message_origin = message_class.__dict__.get(
+                "__tool_message_origin__", message_class
+            )
+            if existing_class is not None and existing_origin is not message_origin:
+                raise ValueError(
+                    f"Tool request name {request!r} is already registered to "
+                    f"{existing_class.__name__}; cannot register "
+                    f"{message_class.__name__}"
+                )
         if isinstance(message_class, XMLToolMessage):
             # XMLToolMessage is not compatible with OpenAI's Tools/functions API,
             # so we disable use of functions API, enable langroid-native Tools,
@@ -704,7 +1033,6 @@ class ChatAgent(Agent):
         super().enable_message_handling(message_class)  # enables handling only
         tools = self._get_tool_list(message_class)
         if message_class is not None:
-            request = message_class.default_value("request")
             if request == "":
                 raise ValueError(
                     f"""
@@ -1184,6 +1512,11 @@ class ChatAgent(Agent):
                 tool = agent.llm_tools_map[request].model_validate_json(
                     self.tool.to_json()
                 )
+                # Propagate the wrapper's DISTRUST mark (#1035): the JSON
+                # round-trip builds a fresh object, silently dropping taint.
+                # Direct stamping is safe: `tool` is framework-fresh here.
+                if self._tainted:
+                    tool._tainted = True
 
                 return agent.handle_tool_message(tool)
 
@@ -1205,9 +1538,18 @@ class ChatAgent(Agent):
                 tool = agent.llm_tools_map[request].model_validate_json(
                     self.tool.to_json()
                 )
+                # Propagate the wrapper's DISTRUST mark (#1035): see above.
+                if self._tainted:
+                    tool._tainted = True
 
                 return await agent.handle_tool_message_async(tool)
 
+        # Every call builds a distinct class; share one origin so enabling a
+        # regenerated AnyTool under "tool_or_function" stays idempotent instead
+        # of tripping the same-name/different-tool registration guard.
+        AnyTool.__tool_message_origin__ = (  # type: ignore[attr-defined]
+            _ANY_TOOL_MESSAGE_ORIGIN
+        )
         return AnyTool
 
     def _strict_recovery_instructions(
@@ -1269,6 +1611,10 @@ class ChatAgent(Agent):
             llm_msg = self.message_history[idx]
         else:
             llm_msg = copy.deepcopy(self.message_history[idx])
+        if llm_msg.content is None or (
+            llm_msg.content == "" and _is_identified_result(llm_msg)
+        ):
+            return llm_msg
         orig_content = llm_msg.content
         new_content = (
             self.parser.truncate_tokens(orig_content, tokens)
@@ -1563,9 +1909,15 @@ class ChatAgent(Agent):
                 # either the message is a str, or it is a fresh ChatDocument
                 # different from the last message in the history
                 llm_msgs = ChatDocument.to_LLMMessage(message, self.oai_tool_calls)
-                # LLM only responds to the content, so only those msgs with
-                # non-empty content should be kept
-                llm_msgs = [m for m in llm_msgs if m.content.strip() != ""]
+                llm_msgs = [m for m in llm_msgs if _llm_message_has_payload(m)]
+                # Canonicalize retained whitespace-only results before token counting.
+                for llm_msg in llm_msgs:
+                    if (
+                        _is_identified_result(llm_msg)
+                        and llm_msg.content is not None
+                        and llm_msg.content.strip() == ""
+                    ):
+                        llm_msg.content = ""
                 if len(llm_msgs) == 0:
                     return [], 0
                 # process tools if any
@@ -1581,7 +1933,6 @@ class ChatAgent(Agent):
             truncate
             and output_len > self.llm.chat_context_length() - self.chat_num_tokens(hist)
         ):
-            CHAT_HISTORY_BUFFER = 300
             # chat + output > max context length,
             # so first try to shorten requested output len to fit;
             # use an extra margin of CHAT_HISTORY_BUFFER tokens
@@ -1603,92 +1954,250 @@ class ChatAgent(Agent):
                     """
                 )
             else:
-                # unacceptably small output len, so compress early parts of conv
-                # history if output_len is still too long.
-                # TODO we should really be doing summarization or other types of
-                #   prompt-size reduction
-                msg_idx_to_compress = 1  # don't touch system msg
-                # we will try compressing msg indices up to but not including
-                # last user msg
-                last_msg_idx_to_compress = (
-                    self.last_message_idx_with_role(
-                        role=Role.USER,
-                    )
-                    - 1
-                )
-                n_truncated = 0
-                while (
-                    self.chat_num_tokens(hist)
-                    > self.llm.chat_context_length() - self.config.llm.min_output_tokens
-                ):
-                    # try dropping early parts of conv history
-                    # TODO we should really be doing summarization or other types of
-                    #   prompt-size reduction
-                    if msg_idx_to_compress > last_msg_idx_to_compress:
-                        # We want to preserve the first message (typically system msg)
-                        # and last message (user msg).
-                        raise ValueError(
-                            """
-                        The (message history + max_output_tokens) is longer than the
-                        max chat context length of this model, and we have tried
-                        reducing the requested max output tokens, as well as truncating
-                        early parts of the message history, to accommodate the model
-                        context length, but we have run out of msgs to drop.
+                # unacceptably small output len, so compress early parts of
+                # conversation history based on the configured strategy
+                strategy = self.config.context_overflow_strategy
 
-                        HINT: In the `llm` field of your `ChatAgentConfig` object,
-                        which is of type `LLMConfig/OpenAIGPTConfig`, try
-                        - increasing `chat_context_length`
-                            (if accurate for the model), or
-                        - decreasing `max_output_tokens`
+                if strategy == "truncate":
+                    # Truncate content of individual messages while preserving
+                    # the message sequence (important for LLM APIs that require
+                    # alternating USER/ASSISTANT messages)
+                    msg_idx_to_compress = 1  # don't touch system msg
+                    # we will try compressing msg indices up to but not including
+                    # last user msg
+                    last_msg_idx_to_compress = (
+                        self.last_message_idx_with_role(
+                            role=Role.USER,
+                        )
+                        - 1
+                    )
+                    n_truncated = 0
+                    _target_tokens = (
+                        self.llm.chat_context_length()
+                        - self.config.llm.min_output_tokens
+                        - CHAT_HISTORY_BUFFER
+                    )
+                    # Truncation floor: never reduce a message's content below
+                    # this many tokens.
+                    _min_keep_tokens = 30
+                    _truncation_warning = "... [Contents truncated!]"
+
+                    def _content_tokens(text: str | None) -> int:
+                        """Token count of message *content* only.
+
+                        `truncate_message` only trims `message.content`, so
+                        using the full `_message_num_tokens` (which includes
+                        attachment payloads) would inflate the count and make
+                        the keep-target too large to ever converge, for
+                        messages carrying file attachments.
+                        """
+                        return (
+                            self.parser.num_tokens(text or "")
+                            if self.parser is not None
+                            # approx fallback, matches truncate_message
+                            else len(text or "") // 4
+                        )
+
+                    # Account for the warning that truncate_message appends
+                    # ("\n" + warning), so the final token count of a
+                    # truncated message does not exceed its keep-target.
+                    _warning_tokens = _content_tokens("\n" + _truncation_warning)
+                    # NOTE: loop termination is guaranteed:
+                    # msg_idx_to_compress strictly increases every iteration
+                    # (truncate or skip), and once it exceeds
+                    # last_msg_idx_to_compress a ValueError is raised. (The
+                    # token count need not decrease every iteration, so
+                    # termination rests on the index advancing.)
+                    while self.chat_num_tokens(hist) > _target_tokens:
+                        if msg_idx_to_compress > last_msg_idx_to_compress:
+                            # We want to preserve the first message (typically
+                            # system msg) and last message (user msg).
+                            raise ValueError(
+                                """
+                            The (message history + max_output_tokens) is longer than the
+                            max chat context length of this model, and we have tried
+                            reducing the requested max output tokens, as well as
+                            truncating early parts of the message history, to
+                            accommodate the model context length, but we have run out
+                            of msgs to truncate.
+
+                            HINT: In the `llm` field of your `ChatAgentConfig` object,
+                            which is of type `LLMConfig/OpenAIGPTConfig`, try
+                            - increasing `chat_context_length`
+                                (if accurate for the model), or
+                            - decreasing `max_output_tokens`
+                            """
+                            )
+                        _msg_tokens = _content_tokens(hist[msg_idx_to_compress].content)
+                        if _msg_tokens <= _min_keep_tokens + _warning_tokens:
+                            # Truncating this message cannot shrink the total:
+                            # its content is already at/below the keep-floor
+                            # plus the appended warning; leave it intact.
+                            msg_idx_to_compress += 1
+                            continue
+                        n_truncated += 1
+                        # Distribute the current excess evenly across the
+                        # remaining *compressible* messages, so each retains
+                        # as much content as possible instead of being
+                        # collapsed to the fixed 30-token floor. The excess is
+                        # recomputed every iteration, so the distribution
+                        # self-corrects as we move forward through the
+                        # history.
+                        _current_excess = self.chat_num_tokens(hist) - _target_tokens
+                        # Shrink capacity of each *later* message in the
+                        # compressible range: its content above the floor (net
+                        # of the appended warning). Non-positive entries are
+                        # the tiny messages the skip-check above will leave
+                        # untouched; they must not dilute the even share, so
+                        # only messages with positive capacity count toward
+                        # the denominator (plus this message, which passed the
+                        # skip-check and is therefore compressible).
+                        _later_capacities = [
+                            _content_tokens(m.content)
+                            - _min_keep_tokens
+                            - _warning_tokens
+                            for m in hist[
+                                msg_idx_to_compress + 1 : last_msg_idx_to_compress + 1
+                            ]
+                        ]
+                        _n_remaining = 1 + sum(1 for c in _later_capacities if c > 0)
+                        _even_share = math.ceil(_current_excess / _n_remaining)
+                        # Later messages can shed at most their capacity; this
+                        # message must absorb whatever they cannot, so that
+                        # this single forward pass reaches the target whenever
+                        # that is possible at all.
+                        _later_capacity = sum(c for c in _later_capacities if c > 0)
+                        _reduction = max(_even_share, _current_excess - _later_capacity)
+                        # Extra 2-token slack: re-encoding truncated content
+                        # plus the appended warning can merge/split tokens at
+                        # the boundary, so aim slightly below the target to
+                        # keep the achieved reduction from falling short.
+                        _keep_tokens = max(
+                            _min_keep_tokens,
+                            _msg_tokens - _reduction - _warning_tokens - 2,
+                        )
+                        # compress the msg at idx `msg_idx_to_compress`
+                        hist[msg_idx_to_compress] = self.truncate_message(
+                            msg_idx_to_compress,
+                            tokens=_keep_tokens,
+                            warning=_truncation_warning,
+                        )
+                        msg_idx_to_compress += 1
+
+                    output_len = min(
+                        self.config.llm.model_max_output_tokens,
+                        self.llm.chat_context_length()
+                        - self.chat_num_tokens(hist)
+                        - CHAT_HISTORY_BUFFER,
+                    )
+                    if output_len < self.config.llm.min_output_tokens:
+                        raise ValueError(
+                            f"""
+                            Tried to shorten prompt history for chat mode
+                            but even after truncating all messages except system msg
+                            and last (user) msg, the history token len
+                            {self.chat_num_tokens(hist)} is too long to accommodate
+                            the desired minimum output tokens
+                            {self.config.llm.min_output_tokens} within the
+                            model's context length {self.llm.chat_context_length()}.
+                            Please try shortening the system msg or user prompts,
+                            or adjust `config.llm.min_output_tokens` to be smaller.
+                            """
+                        )
+                    else:
+                        # we MUST have truncated at least one msg
+                        msg_tokens = self.chat_num_tokens()
+                        logger.warning(
+                            f"""
+                        Chat Model context length is {self.llm.chat_context_length()}
+                        tokens, but the current message history is {msg_tokens} tokens
+                        long, which does not allow
+                        {self.config.llm.model_max_output_tokens} output tokens.
+                        Therefore we truncated the first {n_truncated} messages
+                        in the conversation history so that history token
+                        length is reduced to {self.chat_num_tokens(hist)}, and
+                        we use `max_output_tokens = {output_len}`,
+                        so they can fit within the model's context length
+                        of {self.llm.chat_context_length()} tokens.
                         """
                         )
-                    n_truncated += 1
-                    # compress the msg at idx `msg_idx_to_compress`
-                    hist[msg_idx_to_compress] = self.truncate_message(
-                        msg_idx_to_compress,
-                        tokens=30,
-                        warning="... [Contents truncated!]",
+
+                else:  # strategy == "drop_turns"
+                    # Drop complete conversation turns. A complete turn is defined
+                    # as a USER message followed by all messages until the next
+                    # USER message. This is more aggressive but cleaner for voice
+                    # agents with limited context.
+                    n_dropped_turns = 0
+                    while (
+                        self.chat_num_tokens(hist)
+                        > self.llm.chat_context_length()
+                        - self.config.llm.min_output_tokens
+                        - CHAT_HISTORY_BUFFER
+                    ):
+                        # Find the last USER message index
+                        last_user_idx = self.last_message_idx_with_role(role=Role.USER)
+                        if last_user_idx == -1:
+                            break
+
+                        # Find the first complete turn to drop (skip system message)
+                        first_user_idx = -1
+                        for i in range(1, last_user_idx):
+                            if hist[i].role == Role.USER:
+                                first_user_idx = i
+                                break
+                        if first_user_idx == -1:
+                            break
+
+                        # Find the end of this turn: last message before next USER
+                        next_user_idx = -1
+                        for i in range(first_user_idx + 1, last_user_idx + 1):
+                            if hist[i].role == Role.USER:
+                                next_user_idx = i
+                                break
+                        if next_user_idx == -1:
+                            break
+
+                        # Drop the turn
+                        self.clear_history(first_user_idx, next_user_idx - 1)
+                        n_dropped_turns += 1
+
+                    output_len = min(
+                        self.config.llm.model_max_output_tokens,
+                        self.llm.chat_context_length()
+                        - self.chat_num_tokens(hist)
+                        - CHAT_HISTORY_BUFFER,
                     )
-
-                    msg_idx_to_compress += 1
-
-                output_len = min(
-                    self.config.llm.model_max_output_tokens,
-                    self.llm.chat_context_length()
-                    - self.chat_num_tokens(hist)
-                    - CHAT_HISTORY_BUFFER,
-                )
-                if output_len < self.config.llm.min_output_tokens:
-                    raise ValueError(
-                        f"""
-                        Tried to shorten prompt history for chat mode
-                        but even after truncating all messages except system msg and
-                        last (user) msg,
-                        the history token len {self.chat_num_tokens(hist)} is
-                        too long to accommodate the desired minimum output tokens
-                        {self.config.llm.min_output_tokens} within the
-                        model's context length {self.llm.chat_context_length()}.
-                        Please try shortening the system msg or user prompts,
-                        or adjust `config.llm.min_output_tokens` to be smaller.
+                    if output_len < self.config.llm.min_output_tokens:
+                        raise ValueError(
+                            f"""
+                            Tried to shorten prompt history for chat mode
+                            but even after dropping complete turns except the system
+                            msg and last turn, the history token len
+                            {self.chat_num_tokens(hist)} is too long to accommodate
+                            the desired minimum output tokens
+                            {self.config.llm.min_output_tokens} within the
+                            model's context length {self.llm.chat_context_length()}.
+                            Please try shortening the system msg or user prompts,
+                            or adjust `config.llm.min_output_tokens` to be smaller.
+                            """
+                        )
+                    else:
+                        # we MUST have dropped at least one turn
+                        msg_tokens = self.chat_num_tokens()
+                        logger.warning(
+                            f"""
+                        Chat Model context length is {self.llm.chat_context_length()}
+                        tokens, but the current message history is {msg_tokens} tokens
+                        long, which does not allow
+                        {self.config.llm.model_max_output_tokens} output tokens.
+                        Therefore we dropped the first {n_dropped_turns} complete
+                        turn(s) from the conversation history so that history token
+                        length is reduced to {self.chat_num_tokens(hist)}, and
+                        we use `max_output_tokens = {output_len}`,
+                        so they can fit within the model's context length
+                        of {self.llm.chat_context_length()} tokens.
                         """
-                    )
-                else:
-                    # we MUST have truncated at least one msg
-                    msg_tokens = self.chat_num_tokens()
-                    logger.warning(
-                        f"""
-                    Chat Model context length is {self.llm.chat_context_length()}
-                    tokens, but the current message history is {msg_tokens} tokens long,
-                    which does not allow {self.config.llm.model_max_output_tokens}
-                    output tokens.
-                    Therefore we truncated the first {n_truncated} messages
-                    in the conversation history so that history token
-                    length is reduced to {self.chat_num_tokens(hist)}, and
-                    we use `max_output_tokens = {output_len}`,
-                    so they can fit within the model's context length
-                    of {self.llm.chat_context_length()} tokens.
-                    """
-                    )
+                        )
 
         if isinstance(message, ChatDocument):
             # record the position of the corresponding LLMMessage in
@@ -1833,12 +2342,21 @@ class ChatAgent(Agent):
                 response_format=output_format,
             )
         if self.llm.get_stream():
-            self.callbacks.finish_llm_stream(
-                content=str(response),
-                is_tool=self.has_tool_message_attempt(
-                    ChatDocument.from_LLMResponse(response, displayed=True),
-                ),
+            # Create temp ChatDocument for tool check, then clean up to avoid
+            # polluting ObjectRegistry (see PR #939 discussion)
+            temp_doc = ChatDocument.from_LLMResponse(
+                response,
+                displayed=True,
+                recognize_recipient_in_content=self.config.recognize_recipient_in_content,
             )
+            self._call_callback_with_reasoning(
+                "finish_llm_stream",
+                reasoning=response.reasoning,
+                content=response.message or "",
+                tools_content=response.tools_content(),
+                is_tool=self.has_tool_message_attempt(temp_doc),
+            )
+            ObjectRegistry.remove(temp_doc.id())
         self.llm.config.streamer = noop_fn
         if response.cached:
             self.callbacks.cancel_llm_stream()
@@ -1850,7 +2368,11 @@ class ChatAgent(Agent):
             chat=True,
             print_response_stats=self.config.show_stats and not settings.quiet,
         )
-        chat_doc = ChatDocument.from_LLMResponse(response, displayed=True)
+        chat_doc = ChatDocument.from_LLMResponse(
+            response,
+            displayed=True,
+            recognize_recipient_in_content=self.config.recognize_recipient_in_content,
+        )
         self.oai_tool_calls = response.oai_tool_calls or []
         self.oai_tool_id2call.update(
             {t.id: t for t in self.oai_tool_calls if t.id is not None}
@@ -1890,12 +2412,21 @@ class ChatAgent(Agent):
             response_format=output_format,
         )
         if self.llm.get_stream():
-            self.callbacks.finish_llm_stream(
-                content=str(response),
-                is_tool=self.has_tool_message_attempt(
-                    ChatDocument.from_LLMResponse(response, displayed=True),
-                ),
+            # Create temp ChatDocument for tool check, then clean up to avoid
+            # polluting ObjectRegistry (see PR #939 discussion)
+            temp_doc = ChatDocument.from_LLMResponse(
+                response,
+                displayed=True,
+                recognize_recipient_in_content=self.config.recognize_recipient_in_content,
             )
+            self._call_callback_with_reasoning(
+                "finish_llm_stream",
+                reasoning=response.reasoning,
+                content=response.message or "",
+                tools_content=response.tools_content(),
+                is_tool=self.has_tool_message_attempt(temp_doc),
+            )
+            ObjectRegistry.remove(temp_doc.id())
         self.llm.config.streamer_async = async_noop_fn
         if response.cached:
             self.callbacks.cancel_llm_stream()
@@ -1907,7 +2438,11 @@ class ChatAgent(Agent):
             chat=True,
             print_response_stats=self.config.show_stats and not settings.quiet,
         )
-        chat_doc = ChatDocument.from_LLMResponse(response, displayed=True)
+        chat_doc = ChatDocument.from_LLMResponse(
+            response,
+            displayed=True,
+            recognize_recipient_in_content=self.config.recognize_recipient_in_content,
+        )
         self.oai_tool_calls = response.oai_tool_calls or []
         self.oai_tool_id2call.update(
             {t.id: t for t in self.oai_tool_calls if t.id is not None}
@@ -1917,6 +2452,43 @@ class ChatAgent(Agent):
         self._load_output_format(chat_doc)
 
         return chat_doc
+
+    def _call_callback_with_reasoning(
+        self,
+        callback_name: str,
+        reasoning: str,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Call a callback method, only passing 'reasoning' if it accepts it.
+
+        This provides backward compatibility for custom callbacks that don't
+        have the 'reasoning' parameter in their signature.
+
+        Args:
+            callback_name: Name of the callback method (e.g., 'show_llm_response')
+            reasoning: The reasoning content to pass if supported
+            **kwargs: Other arguments to pass to the callback
+        """
+        callback = getattr(self.callbacks, callback_name, None)
+        if callback is None:
+            return
+
+        # Check if callback accepts 'reasoning' param or **kwargs
+        try:
+            sig = inspect.signature(callback)
+            params = sig.parameters
+            accepts_reasoning = "reasoning" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (ValueError, TypeError):
+            # If we can't inspect the signature, assume it doesn't accept reasoning
+            accepts_reasoning = False
+
+        if accepts_reasoning:
+            callback(reasoning=reasoning, **kwargs)
+        else:
+            callback(**kwargs)
 
     def _render_llm_response(
         self, response: ChatDocument | LLMResponse, citation_only: bool = False
@@ -1933,19 +2505,38 @@ class ChatAgent(Agent):
             # streaming was enabled, AND we did not find a cached response.
             # If we are here, it means the response has not yet been displayed.
             cached = f"[red]{self.indent}(cached)[/red]" if is_cached else ""
+            # Track whether we created a temp ChatDocument for cleanup
+            is_temp_doc = isinstance(response, LLMResponse)
             chat_doc = (
                 response
                 if isinstance(response, ChatDocument)
-                else ChatDocument.from_LLMResponse(response, displayed=True)
+                else ChatDocument.from_LLMResponse(
+                    response,
+                    displayed=True,
+                    recognize_recipient_in_content=self.config.recognize_recipient_in_content,
+                )
             )
             # TODO: prepend TOOL: or OAI-TOOL: if it's a tool-call
             if not settings.quiet:
                 print(cached + "[green]" + escape(str(response)))
-            self.callbacks.show_llm_response(
-                content=str(response),
+            if isinstance(response, LLMResponse):
+                content = response.message or ""
+                tools_content = response.tools_content()
+            else:
+                content = response.content
+                tools_content = ""
+            reasoning = response.reasoning if isinstance(response, LLMResponse) else ""
+            self._call_callback_with_reasoning(
+                "show_llm_response",
+                reasoning=reasoning,
+                content=content,
+                tools_content=tools_content,
                 is_tool=self.has_tool_message_attempt(chat_doc),
                 cached=is_cached,
             )
+            # Clean up temp ChatDocument to avoid polluting ObjectRegistry
+            if is_temp_doc:
+                ObjectRegistry.remove(chat_doc.id())
         if isinstance(response, LLMResponse):
             # we are in the context immediately after an LLM responded,
             # we won't have citations yet, so we're done
@@ -1958,8 +2549,11 @@ class ChatAgent(Agent):
             )
             if not settings.quiet:
                 print("[grey37]SOURCES:\n" + escape(citation) + "[/grey37]")
-            self.callbacks.show_llm_response(
+            self._call_callback_with_reasoning(
+                "show_llm_response",
+                reasoning="",  # Citations don't have reasoning
                 content=str(citation),
+                tools_content="",
                 is_tool=False,
                 cached=False,
                 language="text",
@@ -2079,7 +2673,67 @@ class ChatAgent(Agent):
                 "before calling chat_num_tokens()."
             )
         hist = messages if messages is not None else self.message_history
-        return sum([self.parser.num_tokens(m.content) for m in hist])
+        return sum([self._message_num_tokens(m) for m in hist])
+
+    def _message_num_tokens(self, message: LLMMessage) -> int:
+        """Count tokens for a message, including serialized user attachments."""
+        if self.parser is None:
+            raise ValueError(
+                "ChatAgent.parser is None. "
+                "You must set ChatAgent.parser "
+                "before calling _message_num_tokens()."
+            )
+
+        return self.parser.num_tokens(
+            message.content or ""
+        ) + self._attachment_num_tokens(message)
+
+    def _attachment_num_tokens(self, message: LLMMessage) -> int:
+        """
+        Estimate attachment contribution using the serialized payload
+        that is sent in the API request for user messages.
+        """
+        if self.parser is None or message.role != Role.USER or len(message.files) == 0:
+            return 0
+
+        model = self._chat_model_name_for_attachments()
+        n_tokens = sum(
+            self.parser.num_tokens(
+                json.dumps(
+                    attachment.to_dict(model),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            for attachment in message.files
+        )
+        if n_tokens > 0 and not self._attachment_tokens_warned:
+            self._attachment_tokens_warned = True
+            logger.warning(
+                "File attachment payloads are included in context-length "
+                "token accounting; this count is an estimate based on the "
+                "serialized (e.g. base64 data-URI) form of each attachment, "
+                "and may differ from the provider's own accounting."
+            )
+        return n_tokens
+
+    def _chat_model_name_for_attachments(self) -> str:
+        """Return the model name used for attachment serialization."""
+        if self.llm is None:
+            return self.config.llm.chat_model if self.config.llm is not None else ""
+
+        return cast(
+            str,
+            getattr(
+                self.llm,
+                "chat_model_orig",
+                getattr(
+                    getattr(self.llm, "config", None),
+                    "chat_model",
+                    self.config.llm.chat_model if self.config.llm is not None else "",
+                ),
+            ),
+        )
 
     def message_history_str(self, i: Optional[int] = None) -> str:
         """

@@ -1,10 +1,10 @@
 import io
+import logging.handlers
 import os
 import random
 import warnings
 from pathlib import Path
 
-import fitz  # PyMuPDF
 import openai
 import pytest
 from pydantic_settings import SettingsConfigDict
@@ -13,6 +13,7 @@ import langroid as lr
 import langroid.language_models as lm
 from langroid.cachedb.redis_cachedb import RedisCacheConfig
 from langroid.language_models.base import LLMMessage, Role
+from langroid.language_models.model_info import get_model_info
 from langroid.language_models.openai_gpt import (
     AccessWarning,
     OpenAIChatModel,
@@ -161,6 +162,82 @@ def test_llm_config_context_length(mdl: str, ctx: int | None):
     assert mdl.chat_context_length() == ctx or mdl.info().context_length
 
 
+@pytest.mark.parametrize(
+    ("alias_model", "canonical_model"),
+    [
+        (
+            "gemini/gemini-3-flash-preview",
+            lm.GeminiModel.GEMINI_3_FLASH.value,
+        ),
+        (
+            "google/gemini-3-flash-preview",
+            lm.GeminiModel.GEMINI_3_FLASH.value,
+        ),
+        (
+            "gemini/gemini-2.5-flash-lite-preview-06-17",
+            lm.GeminiModel.GEMINI_2_5_FLASH_LITE.value,
+        ),
+    ],
+)
+def test_get_model_info_normalizes_gemini_aliases(
+    alias_model: str, canonical_model: str
+) -> None:
+    assert get_model_info(alias_model) == get_model_info(canonical_model)
+
+
+@pytest.mark.parametrize(
+    ("alias_model", "canonical_model"),
+    [
+        (
+            "gemini/gemini-3-flash-preview",
+            lm.GeminiModel.GEMINI_3_FLASH.value,
+        ),
+        (
+            "gemini/gemini-2.5-flash-lite-preview-06-17",
+            lm.GeminiModel.GEMINI_2_5_FLASH_LITE.value,
+        ),
+    ],
+)
+def test_openai_gpt_context_length_uses_gemini_alias_info(
+    alias_model: str, canonical_model: str
+) -> None:
+    alias_llm = lm.OpenAIGPT(config=lm.OpenAIGPTConfig(chat_model=alias_model))
+    canonical_llm = lm.OpenAIGPT(config=lm.OpenAIGPTConfig(chat_model=canonical_model))
+
+    assert alias_llm.info() == canonical_llm.info()
+    assert alias_llm.chat_context_length() == canonical_llm.chat_context_length()
+
+
+def test_get_model_info_warns_on_unknown_models() -> None:
+    from langroid.language_models.model_info import WARNED_UNKNOWN_MODELS
+
+    model_name = "gemini/gemini-999-unknown-preview"
+    # Ensure this model hasn't been warned about in a prior test so the
+    # warning actually fires.  The cache key is a tuple of the full model
+    # strings passed to _warn_unknown_model (i.e. with the provider prefix).
+    WARNED_UNKNOWN_MODELS.discard((model_name,))
+
+    handler = logging.handlers.MemoryHandler(capacity=100)
+    logger = logging.getLogger("langroid.language_models.model_info")
+    logger.addHandler(handler)
+    try:
+        # Call twice: every lookup of an unknown model must return the
+        # fallback-default ModelInfo, but the warning must fire only once
+        # (deduped via WARNED_UNKNOWN_MODELS).
+        first_info = get_model_info(model_name)
+        second_info = get_model_info(model_name)
+    finally:
+        logger.removeHandler(handler)
+
+    assert first_info.name == "unknown"
+    assert second_info.name == "unknown"
+    messages = [record.getMessage() for record in handler.buffer]
+    matching = [
+        msg for msg in messages if model_name in msg and "fallback defaults" in msg
+    ]
+    assert len(matching) == 1
+
+
 def test_model_selection(test_settings: Settings):
     set_global(test_settings)
 
@@ -307,9 +384,8 @@ def test_llm_langdb(model: str):
 @pytest.mark.parametrize(
     "model",
     [
-        "openrouter/anthropic/claude-3.5-haiku-20241022:beta",
-        "openrouter/mistralai/mistral-small-24b-instruct-2501:free",
-        "openrouter/google/gemini-2.0-flash-lite-001",
+        "openrouter/anthropic/claude-haiku-4.5",
+        "openrouter/google/gemini-2.5-flash-lite",
     ],
 )
 def test_llm_openrouter(model: str):
@@ -449,6 +525,237 @@ def test_portkey_integration():
     finally:
         # Restore original chat model setting
         settings.chat_model = original_chat_model
+
+
+def test_gemini_api_base():
+    """Test that Gemini api_base is configurable for Vertex AI support."""
+    from langroid.language_models.openai_gpt import GEMINI_BASE_URL
+
+    original_chat_model = settings.chat_model
+    settings.chat_model = ""
+
+    # Save and clear env vars that could interfere
+    saved_openai_api_base = os.environ.pop("OPENAI_API_BASE", None)
+    saved_gemini_api_base = os.environ.pop("GEMINI_API_BASE", None)
+
+    try:
+        # Default: api_base should be GEMINI_BASE_URL
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.config.chat_model == "gemini-2.0-flash"
+        assert llm.api_base == GEMINI_BASE_URL
+
+        # Custom api_base: should override default (e.g. Vertex AI endpoint)
+        vertex_url = "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi"
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+            api_base=vertex_url,
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == vertex_url
+
+        # Empty string api_base: should fall back to default
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+            api_base="",
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == GEMINI_BASE_URL
+
+        # None api_base: should fall back to default
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+            api_base=None,
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == GEMINI_BASE_URL
+
+        # OPENAI_API_BASE env var should NOT leak into Gemini api_base
+        os.environ["OPENAI_API_BASE"] = "http://localhost:8000/v1"
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == GEMINI_BASE_URL
+        os.environ.pop("OPENAI_API_BASE")
+
+        # GEMINI_API_BASE env var should be used (e.g. Vertex AI)
+        os.environ["GEMINI_API_BASE"] = vertex_url
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == vertex_url
+        os.environ.pop("GEMINI_API_BASE")
+
+        # GEMINI_API_BASE should take priority over OPENAI_API_BASE
+        os.environ["OPENAI_API_BASE"] = "http://localhost:8000/v1"
+        os.environ["GEMINI_API_BASE"] = vertex_url
+        config = lm.OpenAIGPTConfig(
+            chat_model="gemini/gemini-2.0-flash",
+        )
+        llm = lm.OpenAIGPT(config)
+        assert llm.is_gemini
+        assert llm.api_base == vertex_url
+        os.environ.pop("OPENAI_API_BASE")
+        os.environ.pop("GEMINI_API_BASE")
+    finally:
+        settings.chat_model = original_chat_model
+        # Restore original env vars
+        if saved_openai_api_base is not None:
+            os.environ["OPENAI_API_BASE"] = saved_openai_api_base
+        if saved_gemini_api_base is not None:
+            os.environ["GEMINI_API_BASE"] = saved_gemini_api_base
+
+
+def test_gemini_google_prefix(monkeypatch):
+    """`google/`-prefixed Gemini models route to the Gemini API (issue #995)."""
+    from langroid.language_models.openai_gpt import GEMINI_BASE_URL
+
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("GEMINI_API_BASE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+
+    for chat_model in ("gemini/gemini-2.0-flash", "google/gemini-2.0-flash"):
+        llm = lm.OpenAIGPT(lm.OpenAIGPTConfig(chat_model=chat_model))
+        assert llm.is_gemini
+        assert llm.config.chat_model == "gemini-2.0-flash"
+        assert llm.api_base == GEMINI_BASE_URL
+        assert llm.api_key == "gemini-key"
+
+
+def test_gemini_ignores_last_case_variant_openai_api_base(monkeypatch):
+    """Gemini routing follows pydantic's last-wins env case normalization."""
+    from langroid.language_models.openai_gpt import GEMINI_BASE_URL
+
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("openai_api_base", raising=False)
+    monkeypatch.delenv("GEMINI_API_BASE", raising=False)
+    monkeypatch.setenv("OPENAI_API_BASE", "https://first.example/v1")
+    monkeypatch.setenv("openai_api_base", "https://last.example/v1")
+
+    llm = lm.OpenAIGPT(lm.OpenAIGPTConfig(chat_model="google/gemini-2.0-flash"))
+
+    assert llm.is_gemini
+    assert llm.api_base == GEMINI_BASE_URL
+
+
+@pytest.mark.parametrize(
+    "chat_model",
+    ("google/gemma-3-27b-it", "google/text-bison-001"),
+)
+def test_non_gemini_google_model_is_not_rerouted(monkeypatch, chat_model):
+    """Non-Gemini Google models retain caller routing and credentials."""
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("GEMINI_API_BASE", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-gemini-key")
+    caller_api_key = "caller-api-key"
+
+    llm = lm.OpenAIGPT(
+        lm.OpenAIGPTConfig(chat_model=chat_model, api_key=caller_api_key)
+    )
+
+    assert not llm.is_gemini
+    assert llm.config.chat_model == chat_model
+    assert llm.api_base is None
+    assert llm.api_key == caller_api_key
+
+
+@pytest.mark.parametrize(
+    "chat_model",
+    ("gemini/gemini-2.0-flash", "google/gemini-2.0-flash"),
+)
+@pytest.mark.parametrize(
+    "openai_api_base, explicit_api_base",
+    (
+        ("https://openai-env.example/v1", "https://caller.example/v1"),
+        ("https://shared.example/v1", "https://shared.example/v1"),
+    ),
+)
+def test_gemini_alias_preserves_explicit_api_base(
+    monkeypatch, chat_model, openai_api_base, explicit_api_base
+):
+    """Gemini aliases retain an explicitly configured API base."""
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.setenv("OPENAI_API_BASE", openai_api_base)
+    monkeypatch.setenv("GEMINI_API_BASE", "https://gemini-env.example/v1")
+
+    llm = lm.OpenAIGPT(
+        lm.OpenAIGPTConfig(
+            chat_model=chat_model,
+            api_base=explicit_api_base,
+        )
+    )
+
+    assert llm.is_gemini
+    assert llm.api_base == explicit_api_base
+    expected_model = (
+        chat_model if chat_model.startswith("google/") else "gemini-2.0-flash"
+    )
+    assert llm.config.chat_model == expected_model
+
+
+@pytest.mark.parametrize(
+    "chat_model",
+    ("gemini/gemini-2.0-flash", "google/gemini-2.0-flash"),
+)
+def test_gemini_model_copy_preserves_explicit_api_base(monkeypatch, chat_model):
+    """Gemini configs copied with an API base retain the caller endpoint."""
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.setenv("GEMINI_API_BASE", "https://gemini-env.example/v1")
+    custom_base = "https://caller.example/v1"
+    config = lm.OpenAIGPTConfig(chat_model=chat_model).model_copy(
+        update={"api_base": custom_base}
+    )
+
+    llm = lm.OpenAIGPT(config)
+
+    assert llm.is_gemini
+    assert llm.api_base == custom_base
+
+
+@pytest.mark.parametrize(
+    "chat_model",
+    ("gemini/gemini-2.0-flash", "google/gemini-2.0-flash"),
+)
+def test_gemini_assignment_preserves_explicit_api_base(monkeypatch, chat_model):
+    """Gemini configs assigned an API base retain the caller endpoint."""
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.setenv("GEMINI_API_BASE", "https://gemini-env.example/v1")
+    custom_base = "https://caller.example/v1"
+    config = lm.OpenAIGPTConfig(chat_model=chat_model)
+    config.api_base = custom_base
+
+    llm = lm.OpenAIGPT(config)
+
+    assert llm.is_gemini
+    assert llm.api_base == custom_base
+
+
+def test_gemini_dynamic_config_preserves_api_base(monkeypatch):
+    """Dynamically prefixed Gemini settings retain their API base."""
+    monkeypatch.setattr(settings, "chat_model", "")
+    monkeypatch.setenv("VERTEX_API_BASE", "https://vertex.example/v1")
+    monkeypatch.setenv("GEMINI_API_BASE", "https://gemini-env.example/v1")
+    vertex_config = lm.OpenAIGPTConfig.create("vertex")
+
+    llm = lm.OpenAIGPT(vertex_config(chat_model="google/gemini-2.0-flash"))
+
+    assert llm.is_gemini
+    assert llm.api_base == "https://vertex.example/v1"
+    assert llm.config.chat_model == "google/gemini-2.0-flash"
 
 
 def test_followup_standalone():
@@ -606,6 +913,8 @@ def test_llm_pdf_bytes_and_split():
     assert "Supply Chain" in response.message
 
     # Test splitting PDF into pages and sending individual pages
+    import fitz
+
     doc = fitz.open(pdf_path)
     page_attachments = []
 

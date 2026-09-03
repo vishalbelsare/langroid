@@ -46,7 +46,7 @@ You are welcome to take on un-assigned open [issues](https://github.com/langroid
     - [x] Pinecone 
     - [x] PostgresML (pgvector)
     - [x] Weaviate
-    - [ ] Milvus 
+    - [x] Milvus
     - [ ] Marqo 
     
 - Other LLM APIs, e.g.: 
@@ -181,6 +181,45 @@ You are welcome to submit a PR to support other API-based or local models.
 ## Run tests
 To verify your env is correctly setup, run all tests using `make tests`.
 
+### Running a subset of tests
+
+The full suite is large (and takes ~1.5h in CI), so while iterating you
+usually want to run only the tests relevant to your change.
+
+**Locally**, pass file paths, a keyword filter (`-k`), or a marker (`-m`)
+to pytest:
+
+```bash
+# a single file
+pytest -xvs tests/main/test_table_chat_agent.py
+
+# several files
+pytest tests/main/test_vector_stores.py tests/main/test_retriever_agent.py
+
+# by keyword (matches test names, params, and file names)
+pytest tests/main/test_vector_stores.py -k "qdrant and not hybrid"
+```
+
+`-xvs` = exit on first failure, verbose, show output; `-nc` disables the
+LLM-response cache; `-n auto` runs tests in parallel via `pytest-xdist`.
+
+**In CI**, instead of waiting for the full `Pytest` workflow, trigger the
+manual `pytest-subset` workflow, which runs whatever you pass as
+`pytest_args` (it defaults to the Qdrant-related tests):
+
+```bash
+# default subset, against a branch
+gh workflow run pytest-subset.yml --ref my-branch
+
+# a custom selection
+gh workflow run pytest-subset.yml --ref my-branch \
+    -f pytest_args="tests/main/test_vector_stores.py -k qdrant_cloud"
+```
+
+You can also run it from the GitHub **Actions** tab via "Run workflow".
+Note: `workflow_dispatch` only becomes available once the workflow is on
+the default branch (`main`).
+
 ## IMPORTANT: Please include tests, docs and possibly examples.
 
 For any new features, please include:
@@ -270,3 +309,38 @@ is an ongoing PR, just push to github again and the PR will be updated.
 
 It is strongly recommended to use the `gh` command-line utility when working with git.
 Read more [here](docs/development/github-cli.md).
+
+## Releasing (maintainers)
+
+A release consists of a version bump + GitHub release, followed by a
+PyPI upload. Both steps run non-interactively:
+
+```bash
+make all-patch   # or all-minor / all-major
+make publish
+```
+
+- `make all-patch` bumps the version (via commitizen), pushes `main`
+  and the new tag, creates the GitHub release with auto-generated
+  notes (`gh release create ... --generate-notes`), and builds the
+  wheel + sdist into `dist/`. Release notes can be refined afterwards
+  with `gh release edit <version> --notes-file <file>`.
+- `make publish` uploads `dist/` to PyPI. It reads `PYPI_TOKEN` from
+  the `.env` file in the repository's primary checkout at runtime, so
+  the token never appears on a command line or in any output. Add a
+  line like this to `.env` (which is gitignored):
+
+  ```bash
+  PYPI_TOKEN=pypi-...
+  ```
+
+  The target fails with a clear error if `dist/` is missing either
+  distribution, if the `.env` file is absent, or if `PYPI_TOKEN` is
+  not defined in it. Any `PYPI_TOKEN` already exported in the
+  environment is deliberately ignored; the `.env` file is the single
+  source of truth.
+- Verify the upload independently, e.g.:
+
+  ```bash
+  curl -s https://pypi.org/pypi/langroid/json | jq -r .info.version
+  ```

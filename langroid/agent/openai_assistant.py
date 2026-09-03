@@ -200,7 +200,7 @@ class OpenAIAssistant(ChatAgent):
             return
         if self.config.use_tools:
             sys_msg = self._create_system_and_tools_message()
-            self.set_system_message(sys_msg.content)
+            self.set_system_message(sys_msg.content or "")
         if not self.config.use_functions_api:
             return
         functions, _, _, _, _ = self._function_args()
@@ -551,7 +551,7 @@ class OpenAIAssistant(ChatAgent):
             time.sleep(1)
             timeout -= 1
             if timeout <= 0:
-                return cast(RunStatus, RunStatus.TIMEOUT)
+                return RunStatus.TIMEOUT
 
     async def _wait_for_run_async(
         self,
@@ -569,7 +569,7 @@ class OpenAIAssistant(ChatAgent):
             await asyncio.sleep(1)
             timeout -= 1
             if timeout <= 0:
-                return cast(RunStatus, RunStatus.TIMEOUT)
+                return RunStatus.TIMEOUT
 
     def set_system_message(self, msg: str) -> None:
         """
@@ -610,7 +610,7 @@ class OpenAIAssistant(ChatAgent):
     def _process_run_result(self, status: RunStatus) -> LLMResponse:
         """Process the result of the run."""
         function_call: LLMFunctionCall | None = None
-        response = ""
+        response: str | None = ""
         tool_id = ""
         # IMPORTANT: FIRST save hash key to store result,
         # before it gets updated with the response
@@ -630,6 +630,7 @@ class OpenAIAssistant(ChatAgent):
             # revisit later: multi-tools affects the task.run() loop.
             function_call = tool_call_fn.function
             tool_id = tool_call_fn.id
+            response = None
         result = LLMResponse(
             message=response,
             tool_id=tool_id,
@@ -651,6 +652,8 @@ class OpenAIAssistant(ChatAgent):
         if run.status != RunStatus.REQUIRES_ACTION:  # type: ignore
             return []
 
+        if run.required_action is None:
+            return []
         if (action := run.required_action.type) != "submit_tool_outputs":
             raise ValueError(f"Unexpected required_action type {action}")
         tool_calls = run.required_action.submit_tool_outputs.tool_calls
@@ -672,7 +675,7 @@ class OpenAIAssistant(ChatAgent):
         tool_outputs = [
             {
                 "tool_call_id": msg.tool_id,
-                "output": msg.content,
+                "output": msg.content or "",
             }
         ]
         # run enters queued, in_progress state after this
@@ -737,11 +740,12 @@ class OpenAIAssistant(ChatAgent):
             # But for OAI Assistant, we only assume exactly one tool-call at a time.
             # TODO look into multi-tools
             llm_msg = ChatDocument.to_LLMMessage(message)[0]
+            llm_content = llm_msg.content or ""
             tool_id = llm_msg.tool_id
             if tool_id in self.pending_tool_ids:
                 if isinstance(message, ChatDocument):
                     message.pop_tool_ids()
-                result_msg = f"Result for Tool_id {tool_id}: {llm_msg.content}"
+                result_msg = f"Result for Tool_id {tool_id}: {llm_content}"
                 if tool_id in self.cached_tool_ids:
                     self.cached_tool_ids.remove(tool_id)
                     # add actual result of cached fn-call
@@ -759,7 +763,7 @@ class OpenAIAssistant(ChatAgent):
                 self.pending_tool_ids.remove(tool_id)
             else:
                 # add message to the thread
-                self._add_thread_message(llm_msg.content, role=Role.USER)
+                self._add_thread_message(llm_content, role=Role.USER)
 
         # When message is None, the thread may have no user msgs,
         # Note: system message is NOT placed in the thread by the OpenAI system.
@@ -801,7 +805,7 @@ class OpenAIAssistant(ChatAgent):
                 self.cached_tool_ids += [response.tool_id]
             response_str = str(response.function_call)
         else:
-            response_str = response.message
+            response_str = response.message or ""
         cache_str = "[red](cached)[/red]" if cached else ""
         if not settings.quiet:
             if not cached and self._get_code_logs_str():
@@ -811,7 +815,11 @@ class OpenAIAssistant(ChatAgent):
                     f"{self._get_code_logs_str()}[/magenta]"
                 )
             print(f"{cache_str}[green]" + response_str + "[/green]")
-        cdoc = ChatDocument.from_LLMResponse(response, displayed=False)
+        cdoc = ChatDocument.from_LLMResponse(
+            response,
+            displayed=False,
+            recognize_recipient_in_content=self.config.recognize_recipient_in_content,
+        )
         # Note message.metadata.tool_ids may have been popped above
         tool_ids = (
             []

@@ -1,7 +1,11 @@
+import logging
+import re
 from enum import Enum
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class ModelProvider(str, Enum):
@@ -11,6 +15,7 @@ class ModelProvider(str, Enum):
     ANTHROPIC = "anthropic"
     DEEPSEEK = "deepseek"
     GOOGLE = "google"
+    MINIMAX = "minimax"
     UNKNOWN = "unknown"
 
 
@@ -39,6 +44,16 @@ class OpenAIChatModel(ModelName):
     GPT5 = "gpt-5"
     GPT5_MINI = "gpt-5-mini"
     GPT5_NANO = "gpt-5-nano"
+    GPT5_PRO = "gpt-5-pro"
+    GPT5_1 = "gpt-5.1"
+    GPT5_1_CODEX = "gpt-5.1-codex"
+    GPT5_1_CODEX_MINI = "gpt-5.1-codex-mini"
+    GPT5_1_CHAT = "gpt-5.1-chat"
+    GPT5_2 = "gpt-5.2"
+    GPT5_2_PRO = "gpt-5.2-pro"
+    GPT5_2_CHAT = "gpt-5.2-chat"
+    GPT_OSS_120b = "gpt-oss-120b"
+    GPT_OSS_20b = "gpt-oss-20b"
 
 
 class OpenAICompletionModel(str, Enum):
@@ -51,11 +66,17 @@ class OpenAICompletionModel(str, Enum):
 class AnthropicModel(ModelName):
     """Enum for Anthropic models"""
 
+    CLAUDE_3_OPUS = "claude-3-opus-latest"
+    CLAUDE_3_SONNET = "claude-3-sonnet-latest"
+    CLAUDE_3_HAIKU = "claude-3-haiku-latest"
     CLAUDE_3_5_SONNET = "claude-3-5-sonnet-latest"
     CLAUDE_3_7_SONNET = "claude-3-7-sonnet-latest"
-    CLAUDE_3_OPUS = "claude-3-opus-latest"
-    CLAUDE_3_SONNET = "claude-3-sonnet-20240229"
-    CLAUDE_3_HAIKU = "claude-3-haiku-20240307"
+    CLAUDE_4_OPUS = "claude-opus-4"
+    CLAUDE_4_SONNET = "claude-sonnet-4"
+    CLAUDE_4_HAIKU = "claude-haiku-4"
+    CLAUDE_4_5_OPUS = "claude-opus-4-5"
+    CLAUDE_4_5_SONNET = "claude-sonnet-4-5"
+    CLAUDE_4_5_HAIKU = "claude-haiku-4-5"
 
 
 class DeepSeekModel(ModelName):
@@ -72,13 +93,27 @@ class GeminiModel(ModelName):
     GEMINI_1_5_FLASH = "gemini-1.5-flash"
     GEMINI_1_5_FLASH_8B = "gemini-1.5-flash-8b"
     GEMINI_1_5_PRO = "gemini-1.5-pro"
-    GEMINI_2_5_PRO = "gemini-2.5-pro"
-    GEMINI_2_5_FLASH = "gemini-2.5-flash"
-    GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
-    GEMINI_2_PRO = "gemini-2.0-pro-exp-02-05"
     GEMINI_2_FLASH = "gemini-2.0-flash"
     GEMINI_2_FLASH_LITE = "gemini-2.0-flash-lite"
     GEMINI_2_FLASH_THINKING = "gemini-2.0-flash-thinking-exp"
+    GEMINI_2_PRO = "gemini-2.0-pro-exp-02-05"
+    GEMINI_2_5_FLASH = "gemini-2.5-flash"
+    GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
+    GEMINI_2_5_PRO = "gemini-2.5-pro"
+    GEMINI_3_FLASH = "gemini-3-flash"
+    GEMINI_3_PRO = "gemini-3-pro"
+
+
+class MiniMaxModel(ModelName):
+    """Enum for MiniMax models"""
+
+    MINIMAX_M2_7 = "MiniMax-M2.7"
+    MINIMAX_M2_7_HIGHSPEED = "MiniMax-M2.7-highspeed"
+    MINIMAX_M2_5 = "MiniMax-M2.5"
+    MINIMAX_M2_5_HIGHSPEED = "MiniMax-M2.5-highspeed"
+    MINIMAX_M2_1 = "MiniMax-M2.1"
+    MINIMAX_M2_1_HIGHSPEED = "MiniMax-M2.1-highspeed"
+    MINIMAX_M2 = "MiniMax-M2"
 
 
 class OpenAI_API_ParamInfo(BaseModel):
@@ -95,6 +130,14 @@ class OpenAI_API_ParamInfo(BaseModel):
             OpenAIChatModel.GPT5.value,
             OpenAIChatModel.GPT5_MINI.value,
             OpenAIChatModel.GPT5_NANO.value,
+            OpenAIChatModel.GPT5_PRO.value,
+            OpenAIChatModel.GPT5_1.value,
+            OpenAIChatModel.GPT5_1_CODEX.value,
+            OpenAIChatModel.GPT5_1_CODEX_MINI.value,
+            OpenAIChatModel.GPT5_2.value,
+            OpenAIChatModel.GPT5_2_PRO.value,
+            OpenAIChatModel.GPT_OSS_120b.value,
+            OpenAIChatModel.GPT_OSS_20b.value,
             GeminiModel.GEMINI_2_5_PRO.value,
             GeminiModel.GEMINI_2_5_FLASH.value,
             GeminiModel.GEMINI_2_5_FLASH_LITE.value,
@@ -131,6 +174,18 @@ class ModelInfo(BaseModel):
     has_tools: bool = True  # Does model API support tools/function-calling?
     needs_first_user_message: bool = False  # Does API need first msg to be from user?
     description: Optional[str] = None
+
+
+GEMINI_CANONICAL_MODEL_NAMES = {model.value for model in GeminiModel}
+# Trailing "-MM-DD" date stamp on Gemini variant names (e.g. "-01-21").
+# ASCII digits only, anchored with \Z: "$" would also match just before a
+# trailing newline, letting hostile names like "...-05-20\n" through.
+_GEMINI_DATE_SUFFIX = re.compile(r"-([0-9]{2})-([0-9]{2})\Z")
+_GEMINI_DAYS_PER_MONTH = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+# Keyword suffixes marking preview/experimental Gemini variants.
+_GEMINI_KEYWORD_SUFFIXES = ("-preview", "-exp", "-experimental", "-latest")
+DEFAULT_MODEL_INFO = ModelInfo()
+WARNED_UNKNOWN_MODELS: set[tuple[str, ...]] = set()
 
 
 # Model information registry
@@ -248,7 +303,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         allows_system_message=False,
         has_structured_output=True,
         unsupported_params=["temperature"],
-        rename_params={"max_tokens": "max_completion_tokens"},
         has_tools=False,
         description="O1 Reasoning LM",
     ),
@@ -264,7 +318,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         allows_system_message=False,
         has_structured_output=True,
         unsupported_params=["temperature"],
-        rename_params={"max_tokens": "max_completion_tokens"},
         has_tools=False,
         description="O1 Reasoning LM",
     ),
@@ -280,7 +333,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         allows_system_message=False,
         has_structured_output=True,
         unsupported_params=["temperature", "stream"],
-        rename_params={"max_tokens": "max_completion_tokens"},
         has_tools=False,
         description="O1 Mini Reasoning LM",
     ),
@@ -296,7 +348,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         allows_system_message=False,
         has_structured_output=True,
         unsupported_params=["temperature", "stream"],
-        rename_params={"max_tokens": "max_completion_tokens"},
         has_tools=False,
         description="O3 Mini Reasoning LM",
     ),
@@ -312,7 +363,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         allows_system_message=False,
         has_structured_output=True,
         unsupported_params=["temperature", "stream"],
-        rename_params={"max_tokens": "max_completion_tokens"},
         has_tools=False,
         description="O3 Mini Reasoning LM",
     ),
@@ -326,8 +376,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         output_cost_per_million=10.00,
         has_structured_output=True,
         unsupported_params=["temperature"],
-        rename_params={"max_tokens": "max_completion_tokens"},
-        has_tools=False,
         description="GPT-5",
     ),
     OpenAIChatModel.GPT5_MINI.value: ModelInfo(
@@ -340,8 +388,6 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         output_cost_per_million=2.00,
         has_structured_output=True,
         unsupported_params=["temperature"],
-        rename_params={"max_tokens": "max_completion_tokens"},
-        has_tools=False,
         description="GPT-5 Mini",
     ),
     OpenAIChatModel.GPT5_NANO.value: ModelInfo(
@@ -354,9 +400,125 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         output_cost_per_million=0.40,
         has_structured_output=True,
         unsupported_params=["temperature"],
-        rename_params={"max_tokens": "max_completion_tokens"},
-        has_tools=False,
         description="GPT-5 Nano",
+    ),
+    OpenAIChatModel.GPT5_PRO.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_PRO.value,
+        provider=ModelProvider.OPENAI,
+        context_length=400_000,
+        max_output_tokens=272_000,
+        input_cost_per_million=15.00,
+        cached_cost_per_million=7.50,
+        output_cost_per_million=120.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5 Pro",
+    ),
+    OpenAIChatModel.GPT5_1.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_1.value,
+        provider=ModelProvider.OPENAI,
+        context_length=400_000,
+        max_output_tokens=128_000,
+        input_cost_per_million=1.25,
+        cached_cost_per_million=0.13,
+        output_cost_per_million=10.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.1",
+    ),
+    OpenAIChatModel.GPT5_1_CODEX.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_1_CODEX.value,
+        provider=ModelProvider.OPENAI,
+        context_length=128_000,
+        max_output_tokens=128_000,
+        input_cost_per_million=1.25,
+        cached_cost_per_million=0.125,
+        output_cost_per_million=10.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.1 Codex",
+    ),
+    OpenAIChatModel.GPT5_1_CODEX_MINI.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_1_CODEX_MINI.value,
+        provider=ModelProvider.OPENAI,
+        context_length=400_000,
+        max_output_tokens=128_000,
+        input_cost_per_million=0.25,
+        cached_cost_per_million=0.025,
+        output_cost_per_million=2.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.1 Codex Mini",
+    ),
+    OpenAIChatModel.GPT5_1_CHAT.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_1_CHAT.value,
+        provider=ModelProvider.OPENAI,
+        context_length=128_000,
+        max_output_tokens=16_384,
+        input_cost_per_million=1.25,
+        cached_cost_per_million=0.125,
+        output_cost_per_million=10.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.1 Chat",
+    ),
+    OpenAIChatModel.GPT5_2.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_2.value,
+        provider=ModelProvider.OPENAI,
+        context_length=400_000,
+        max_output_tokens=128_000,
+        input_cost_per_million=1.75,
+        cached_cost_per_million=0.175,
+        output_cost_per_million=14.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.2",
+    ),
+    OpenAIChatModel.GPT5_2_PRO.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_2_PRO.value,
+        provider=ModelProvider.OPENAI,
+        context_length=400_000,
+        max_output_tokens=272_000,
+        input_cost_per_million=15.00,
+        cached_cost_per_million=7.50,
+        output_cost_per_million=120.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.2 Pro",
+    ),
+    OpenAIChatModel.GPT5_2_CHAT.value: ModelInfo(
+        name=OpenAIChatModel.GPT5_2_CHAT.value,
+        provider=ModelProvider.OPENAI,
+        context_length=128_000,
+        max_output_tokens=16_384,
+        input_cost_per_million=1.75,
+        cached_cost_per_million=0.175,
+        output_cost_per_million=14.00,
+        has_structured_output=True,
+        unsupported_params=["temperature"],
+        description="GPT-5.2 Chat",
+    ),
+    OpenAIChatModel.GPT_OSS_120b.value: ModelInfo(
+        name=OpenAIChatModel.GPT_OSS_120b.value,
+        provider=ModelProvider.OPENAI,
+        context_length=131_072,
+        max_output_tokens=65_535,
+        input_cost_per_million=0.15,
+        cached_cost_per_million=0.075,
+        output_cost_per_million=0.60,
+        has_structured_output=True,
+        description="GPT OSS 120B",
+    ),
+    OpenAIChatModel.GPT_OSS_20b.value: ModelInfo(
+        name=OpenAIChatModel.GPT_OSS_20b.value,
+        provider=ModelProvider.OPENAI,
+        context_length=131_072,
+        max_output_tokens=65_535,
+        input_cost_per_million=0.075,
+        cached_cost_per_million=0.037,
+        output_cost_per_million=0.30,
+        has_structured_output=True,
+        description="GPT OSS 20B",
     ),
     # Anthropic Models
     AnthropicModel.CLAUDE_3_5_SONNET.value: ModelInfo(
@@ -516,6 +678,99 @@ MODEL_INFO: Dict[str, ModelInfo] = {
         rename_params={"max_tokens": "max_completion_tokens"},
         description="Gemini 2.5 Flash Lite",
     ),
+    # Gemini 3 Models
+    GeminiModel.GEMINI_3_PRO.value: ModelInfo(
+        name=GeminiModel.GEMINI_3_PRO.value,
+        provider=ModelProvider.GOOGLE,
+        context_length=1_000_000,
+        max_output_tokens=64_000,
+        input_cost_per_million=2.00,
+        cached_cost_per_million=0.20,
+        output_cost_per_million=12.00,
+        rename_params={"max_tokens": "max_completion_tokens"},
+        description="Gemini 3 Pro",
+    ),
+    GeminiModel.GEMINI_3_FLASH.value: ModelInfo(
+        name=GeminiModel.GEMINI_3_FLASH.value,
+        provider=ModelProvider.GOOGLE,
+        context_length=1_048_576,
+        max_output_tokens=65_535,
+        input_cost_per_million=0.50,
+        cached_cost_per_million=0.05,
+        output_cost_per_million=3.00,
+        description="Gemini 3 Flash",
+    ),
+    # MiniMax Models
+    MiniMaxModel.MINIMAX_M2_7.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_7.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=131_072,
+        input_cost_per_million=0.30,
+        output_cost_per_million=1.20,
+        has_structured_output=True,
+        description="MiniMax M2.7 (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2_7_HIGHSPEED.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_7_HIGHSPEED.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=131_072,
+        input_cost_per_million=0.15,
+        output_cost_per_million=0.60,
+        has_structured_output=True,
+        description="MiniMax M2.7 Highspeed (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2_5.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_5.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=65_536,
+        input_cost_per_million=0.30,
+        output_cost_per_million=1.20,
+        has_structured_output=True,
+        description="MiniMax M2.5 (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2_5_HIGHSPEED.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_5_HIGHSPEED.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=65_536,
+        input_cost_per_million=0.15,
+        output_cost_per_million=0.60,
+        has_structured_output=True,
+        description="MiniMax M2.5 Highspeed (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2_1.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_1.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=65_536,
+        input_cost_per_million=0.27,
+        output_cost_per_million=0.95,
+        has_structured_output=True,
+        description="MiniMax M2.1 (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2_1_HIGHSPEED.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2_1_HIGHSPEED.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=65_536,
+        input_cost_per_million=0.14,
+        output_cost_per_million=0.48,
+        has_structured_output=True,
+        description="MiniMax M2.1 Highspeed (204K context)",
+    ),
+    MiniMaxModel.MINIMAX_M2.value: ModelInfo(
+        name=MiniMaxModel.MINIMAX_M2.value,
+        provider=ModelProvider.MINIMAX,
+        context_length=204_800,
+        max_output_tokens=65_536,
+        input_cost_per_million=0.27,
+        output_cost_per_million=0.95,
+        has_structured_output=True,
+        description="MiniMax M2 (204K context)",
+    ),
 }
 
 
@@ -534,11 +789,103 @@ def get_model_info(
         None,  # Default value if the iterator is exhausted (no valid info found)
     )
 
-    # Return the found info, or a default ModelInfo if none was found
-    return found_info or ModelInfo()
+    if found_info is not None:
+        return found_info
+
+    normalized_models = _normalize_model_names(models_to_try)
+    found_info = next(
+        (
+            info
+            for normalized_model in normalized_models
+            if (info := _get_model_info(normalized_model)) is not None
+        ),
+        None,
+    )
+    if found_info is not None:
+        return found_info
+
+    _warn_unknown_model(models_to_try)
+    return ModelInfo()
 
 
 def _get_model_info(model: str | ModelName) -> ModelInfo | None:
     if isinstance(model, str):
         return MODEL_INFO.get(model)
     return MODEL_INFO.get(model.value)
+
+
+def _normalize_model_names(models: List[str | ModelName]) -> List[str]:
+    normalized_models: List[str] = []
+    seen: set[str] = set()
+    for model in models:
+        normalized_model = _normalize_gemini_model_name(_model_name(model))
+        if normalized_model is None or normalized_model in seen:
+            continue
+        seen.add(normalized_model)
+        normalized_models.append(normalized_model)
+    return normalized_models
+
+
+def _normalize_gemini_model_name(model: str) -> str | None:
+    base_model = model.rsplit("/", 1)[-1]
+    if base_model in GEMINI_CANONICAL_MODEL_NAMES:
+        return base_model
+    if not base_model.startswith("gemini-"):
+        return None
+
+    # Strip a trailing "-MM-DD" date stamp; covers names like
+    # "gemini-2.0-flash-thinking-exp-01-21" whose canonical form already
+    # ends with "-exp" (#995). The regex is strict (ASCII digits, anchored
+    # with \Z), so lookalike dates -- unicode digits, trailing newline or
+    # control characters -- do not take this path. Accept the date-stripped
+    # candidate only when it ends with a keyword suffix: a bare-dated
+    # unknown name such as "gemini-2.5-pro-03-25" must not be guessed as
+    # "gemini-2.5-pro".
+    candidate = base_model
+    date_match = _GEMINI_DATE_SUFFIX.search(base_model)
+    if date_match is not None:
+        month, day = (int(part) for part in date_match.groups())
+        if (
+            1 <= month <= len(_GEMINI_DAYS_PER_MONTH)
+            and 1 <= day <= _GEMINI_DAYS_PER_MONTH[month - 1]
+        ):
+            candidate = base_model[: date_match.start()]
+    if candidate in GEMINI_CANONICAL_MODEL_NAMES and candidate.endswith(
+        _GEMINI_KEYWORD_SUFFIXES
+    ):
+        return candidate
+
+    # Otherwise split at the first occurrence of each keyword suffix and
+    # return the canonical prefix when present, e.g.
+    # "gemini-2.5-flash-preview-05-20" -> "gemini-2.5-flash". This keeps
+    # parity with the historical behavior for every alias outside the
+    # date-stripped case above, including junk-suffixed names like
+    # "gemini-2.5-flash-preview-junk".
+    for suffix in _GEMINI_KEYWORD_SUFFIXES:
+        stripped = candidate.split(suffix, maxsplit=1)[0]
+        if stripped != candidate and stripped in GEMINI_CANONICAL_MODEL_NAMES:
+            return stripped
+    return None
+
+
+def _warn_unknown_model(models: List[str | ModelName]) -> None:
+    model_names = tuple(_model_name(model) for model in models)
+    if model_names in WARNED_UNKNOWN_MODELS:
+        return
+
+    WARNED_UNKNOWN_MODELS.add(model_names)
+    logger.warning(
+        "Unknown model info for %s; using fallback defaults "
+        "(context_length=%s, max_output_tokens=%s). "
+        "Context-length checks may be inaccurate. "
+        "Set `chat_context_length` explicitly if needed.",
+        ", ".join(model_names),
+        DEFAULT_MODEL_INFO.context_length,
+        DEFAULT_MODEL_INFO.max_output_tokens,
+    )
+
+
+def _model_name(model: str | ModelName) -> str:
+    if isinstance(model, str):
+        return model
+    return model.value

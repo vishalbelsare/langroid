@@ -1,9 +1,24 @@
 import asyncio
 import datetime
+import inspect
 import logging
+import os
+import re
 from base64 import b64decode
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeAlias, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    TypeAlias,
+    Union,
+    cast,
+)
 
 from dotenv import load_dotenv
 from fastmcp.client import Client
@@ -12,12 +27,21 @@ from fastmcp.client.roots import (
     RootsList,
 )
 from fastmcp.client.sampling import SamplingHandler
-from fastmcp.client.transports import ClientTransport
+from fastmcp.client.transports import ClientTransport, StdioTransport
+
+try:
+    # Optional transports; import guarded for environments without uvx/npx
+    from fastmcp.client.transports import NpxStdioTransport, UvxStdioTransport
+except Exception:  # pragma: no cover - optional
+    NpxStdioTransport = tuple()  # type: ignore
+    UvxStdioTransport = tuple()  # type: ignore
+from anyio import ClosedResourceError
 from fastmcp.server import FastMCP
 from mcp.client.session import (
     LoggingFnT,
     MessageHandlerFnT,
 )
+from mcp.shared.exceptions import McpError
 from mcp.types import (
     BlobResourceContents,
     CallToolResult,
@@ -36,7 +60,16 @@ from langroid.parsing.file_attachment import FileAttachment
 
 load_dotenv()  # load environment variables from .env
 
-FastMCPServerSpec: TypeAlias = str | FastMCP[Any] | ClientTransport | AnyUrl
+# Concrete server/transport spec accepted by fastmcp.Client
+FastMCPServerConcrete: TypeAlias = str | FastMCP[Any] | ClientTransport | AnyUrl
+# Public spec we accept: concrete spec or a zero-arg factory returning a spec
+FastMCPServerSpec: TypeAlias = (
+    FastMCPServerConcrete | Callable[[], FastMCPServerConcrete]
+)
+
+# Sentinel marking a $defs entry that is currently being resolved into a model,
+# used to break reference cycles when converting JSON-Schema $ref nodes.
+_REF_IN_PROGRESS = object()
 
 
 class FastMCPClient:
@@ -46,8 +79,9 @@ class FastMCPClient:
     """
 
     logger = logging.getLogger(__name__)
-    _cm: Optional[Client] = None
-    client: Optional[Client] = None
+    _cm: Optional[Client[ClientTransport]] = None
+    client: Optional[Client[ClientTransport]] = None
+    read_timeout_seconds: datetime.timedelta | None = None
 
     def __init__(
         self,
@@ -61,11 +95,15 @@ class FastMCPClient:
         log_handler: LoggingFnT | None = None,
         message_handler: MessageHandlerFnT | None = None,
         read_timeout_seconds: datetime.timedelta | None = None,
+        tool_name_prefix: str | None = None,
     ) -> None:
         """Initialize the FastMCPClient.
 
         Args:
             server: FastMCP server or path to such a server
+            tool_name_prefix: Optional namespace prepended to generated Langroid
+                tool names as ``<prefix>__<server-tool-name>``. Calls to the MCP
+                server continue to use its original tool name.
         """
         self.server = server
         self.client = None
@@ -74,26 +112,124 @@ class FastMCPClient:
         self.roots = roots
         self.log_handler = log_handler
         self.message_handler = message_handler
-        self.read_timeout_seconds = read_timeout_seconds
+        # Default a slightly larger read timeout for stdio transports on first
+        # connects. Allows flaky subprocess servers a bit more time to boot.
+        if read_timeout_seconds is None:
+            try:
+                default_secs = int(os.getenv("LANGROID_MCP_READ_TIMEOUT", "15"))
+                self.read_timeout_seconds = datetime.timedelta(seconds=default_secs)
+            except Exception:
+                self.read_timeout_seconds = None
+        else:
+            self.read_timeout_seconds = read_timeout_seconds
+        if tool_name_prefix is not None and (
+            not isinstance(tool_name_prefix, str)
+            or re.fullmatch(r"[a-zA-Z0-9_]+", tool_name_prefix) is None
+        ):
+            raise ValueError(
+                "tool_name_prefix must fully match the ASCII pattern " "[a-zA-Z0-9_]+"
+            )
         self.persist_connection = persist_connection
         self.forward_text_resources = forward_text_resources
         self.forward_blob_resources = forward_blob_resources
         self.forward_images = forward_images
+        self.tool_name_prefix = tool_name_prefix
 
     async def __aenter__(self) -> "FastMCPClient":
-        """Enter the async context manager and connect inner client."""
-        # create inner client context manager
-        self._cm = Client(
-            self.server,
-            sampling_handler=self.sampling_handler,
-            roots=self.roots,
-            log_handler=self.log_handler,
-            message_handler=self.message_handler,
-            timeout=self.read_timeout_seconds,
-        )
-        # actually enter it (opens the session)
-        self.client = await self._cm.__aenter__()  # type: ignore
-        return self
+        """Enter the async context manager and connect inner client.
+
+        Always obtain a fresh transport/spec via a factory, then connect.
+        If the session initialization fails due to a transient stdio issue
+        (e.g., ClosedResourceError / connection closed), retry once with a
+        new transport instance for better resilience across fastmcp/mcp
+        versions and server launch timing.
+        """
+        # Always normalize to a server factory and create a fresh spec
+        server_factory = self._as_server_factory(self.server)
+
+        # Configurable retry/backoff for transient stdio startup races.
+        max_retries = int(os.getenv("LANGROID_MCP_CONNECT_RETRIES", "6"))
+        try:
+            backoff_base = float(os.getenv("LANGROID_MCP_CONNECT_BACKOFF_BASE", "0.35"))
+        except Exception:
+            backoff_base = 0.35
+
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, max_retries + 1):
+            server_spec: FastMCPServerConcrete = server_factory()
+            # create inner client context manager
+            self._cm = Client(  # type: ignore[assignment]
+                server_spec,
+                sampling_handler=self.sampling_handler,
+                roots=self.roots,
+                log_handler=self.log_handler,
+                message_handler=self.message_handler,
+                timeout=self.read_timeout_seconds,
+            )
+            try:
+                # actually enter it (opens the session)
+                self.client = await self._cm.__aenter__()  # type: ignore
+                return self
+            except (ClosedResourceError, McpError) as e:
+                # Common transient failures when a subprocess exits early or
+                # closes during initialize. Retry once with a fresh transport.
+                self.logger.warning(
+                    "FastMCPClient connect attempt %s failed: %s. Retrying...",
+                    attempt,
+                    e,
+                )
+                last_err = e
+                # ensure we reset _cm/client before retry
+                try:
+                    if self._cm is not None:
+                        await self._cm.__aexit__(None, None, None)  # type: ignore
+                except Exception:
+                    pass
+                self._cm = None
+                self.client = None
+                # brief backoff to allow server process to finish booting
+                try:
+                    await asyncio.sleep(min(backoff_base * (2 ** (attempt - 1)), 2.0))
+                except Exception:
+                    pass
+                continue
+            except RuntimeError as e:
+                # fastmcp wraps ClosedResourceError into RuntimeError
+                # "Server session was closed unexpectedly". Treat as transient.
+                emsg = str(e)
+                if (
+                    "Server session was closed unexpectedly" in emsg
+                    or "Client failed to connect" in emsg
+                ):
+                    self.logger.warning(
+                        (
+                            "FastMCPClient connect attempt %s failed (runtime): %s. "
+                            "Retrying..."
+                        ),
+                        attempt,
+                        e,
+                    )
+                    last_err = e
+                    try:
+                        if self._cm is not None:
+                            await self._cm.__aexit__(None, None, None)  # type: ignore
+                    except Exception:
+                        pass
+                    self._cm = None
+                    self.client = None
+                    try:
+                        await asyncio.sleep(
+                            min(backoff_base * (2 ** (attempt - 1)), 2.0)
+                        )
+                    except Exception:
+                        pass
+                    continue
+                # otherwise re-raise
+                raise
+
+        # If we get here both attempts failed
+        assert last_err is not None
+        raise last_err
 
     async def connect(self) -> None:
         """Open the underlying session."""
@@ -131,7 +267,13 @@ class FastMCPClient:
             )
 
     def _schema_to_field(
-        self, name: str, schema: Dict[str, Any], prefix: str
+        self,
+        name: str,
+        schema: Any,
+        prefix: str,
+        is_required: bool = True,
+        defs: Optional[Dict[str, Any]] = None,
+        ref_cache: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Any, Any]:
         """Convert a JSON Schema snippet into a (type, Field) tuple.
 
@@ -139,43 +281,193 @@ class FastMCPClient:
             name: Name of the field.
             schema: JSON Schema for this field.
             prefix: Prefix to use for nested model names.
+            is_required: Whether this field is required (from JSON Schema "required").
+            defs: The tool schema's ``$defs`` registry, used to resolve ``$ref``
+                nodes into nested models. fastmcp emits pydantic-model params
+                (and their nested/union/array members) as a local ``$ref`` into
+                ``$defs``.
+            ref_cache: Per-tool cache mapping a ``$defs`` name to its already
+                built type, so shared models are reused and reference cycles can
+                be detected (a name mapped to ``_REF_IN_PROGRESS`` is currently
+                being resolved).
 
         Returns:
             A tuple of (python_type, Field(...)) for create_model.
         """
+        if defs is None:
+            defs = {}
+        if ref_cache is None:
+            ref_cache = {}
+        if not isinstance(schema, dict):
+            default = ... if is_required else None
+            return Any, Field(default=default)
+
         t = schema.get("type")
-        default = schema.get("default", ...)
+        # Use schema default if present, otherwise:
+        # ... for required fields, None for optional fields
+        if "default" in schema:
+            default = schema["default"]
+        else:
+            default = ... if is_required else None
         desc = schema.get("description")
+        # $ref → resolve against $defs and build a nested model. fastmcp emits
+        # pydantic-model params (and nested/union/array members) as a local
+        # ``$ref`` like "#/$defs/Address"; without resolution these degrade to
+        # the permissive `Any` fallback below. A ref to an unknown def, or one
+        # hit while that same def is still being resolved (a cycle), falls back
+        # to `Any`. Resolved types are cached per tool so shared defs are built
+        # once and reused.
+        ref = schema.get("$ref")
+        if "$ref" in schema and (
+            not isinstance(ref, str) or not ref.startswith("#/$defs/")
+        ):
+            return Any, Field(default=default, description=desc)
+        if isinstance(ref, str):
+            def_name = ref[len("#/$defs/") :]
+            if def_name in ref_cache:
+                cached = ref_cache[def_name]
+                if cached is _REF_IN_PROGRESS:
+                    return Any, Field(default=default, description=desc)
+                ref_type = cached if is_required else Optional[cached]
+                return ref_type, Field(default=default, description=desc)
+            resolved = defs.get(def_name)
+            if not isinstance(resolved, dict):
+                return Any, Field(default=default, description=desc)
+            ref_cache[def_name] = _REF_IN_PROGRESS
+            built, _ = self._schema_to_field(
+                def_name,
+                resolved,
+                prefix,
+                is_required=True,
+                defs=defs,
+                ref_cache=ref_cache,
+            )
+            ref_cache[def_name] = built
+            ref_type = built if is_required else Optional[built]
+            return ref_type, Field(default=default, description=desc)
+        # Enum / const → Literal, but only for Literal-compatible scalar values
+        # (str/int/bool/None). This takes precedence over the plain `type`
+        # branches so the allowed values are preserved for validation and echoed
+        # back into the model's JSON schema (which the LLM sees). JSON-Schema
+        # enums may also hold floats or objects, which Literal rejects; those
+        # fall through to the type-based handling below.
+        enum_values = schema.get(
+            "enum", [schema["const"]] if "const" in schema else None
+        )
+        # `enum` must be a list per JSON Schema; guard against malformed
+        # metadata (e.g. a bare scalar) so it degrades to type-based handling
+        # instead of raising when we iterate.
+        if (
+            isinstance(enum_values, list)
+            and enum_values
+            and all(isinstance(v, (str, int, bool)) or v is None for v in enum_values)
+        ):
+            literal_type = Literal[tuple(enum_values)]  # type: ignore[valid-type]
+            if not is_required:
+                literal_type = Optional[literal_type]  # type: ignore[assignment]
+            return literal_type, Field(default=default, description=desc)
         # Object → nested BaseModel
         if t == "object" and "properties" in schema:
             sub_name = f"{prefix}_{name.capitalize()}"
             sub_fields: Dict[str, Tuple[type, Any]] = {}
-            for k, sub_s in schema["properties"].items():
-                ftype, fld = self._schema_to_field(sub_name + k, sub_s, sub_name)
+            nested_properties = schema.get("properties")
+            if not isinstance(nested_properties, dict):
+                nested_properties = {}
+            # Get required fields for this nested object
+            nested_required_list = schema.get("required", [])
+            if not isinstance(nested_required_list, list):
+                nested_required_list = []
+            nested_required = {
+                name for name in nested_required_list if isinstance(name, str)
+            }
+            for k, sub_s in nested_properties.items():
+                ftype, fld = self._schema_to_field(
+                    sub_name + k,
+                    sub_s,
+                    sub_name,
+                    is_required=k in nested_required,
+                    defs=defs,
+                    ref_cache=ref_cache,
+                )
                 sub_fields[k] = (ftype, fld)
             submodel = create_model(  # type: ignore
                 sub_name,
                 __base__=BaseModel,
                 **sub_fields,
             )
-            return submodel, Field(default=default, description=desc)  # type: ignore
+            # Wrap in Optional if not required
+            model_type = submodel if is_required else Optional[submodel]
+            return model_type, Field(default=default, description=desc)  # type: ignore
         # Array → List of items
         if t == "array" and "items" in schema:
-            item_type, _ = self._schema_to_field(name, schema["items"], prefix)
-            return List[item_type], Field(default=default, description=desc)  # type: ignore
+            items_schema = schema.get("items")
+            item_type, _ = self._schema_to_field(
+                name, items_schema, prefix, defs=defs, ref_cache=ref_cache
+            )
+            array_type = List[item_type]  # type: ignore
+            if not is_required:
+                array_type = Optional[array_type]  # type: ignore
+            return array_type, Field(default=default, description=desc)  # type: ignore
         # Primitive types
         if t == "string":
-            return str, Field(default=default, description=desc)
+            str_type = str if is_required else Optional[str]
+            return str_type, Field(default=default, description=desc)
         if t == "integer":
-            return int, Field(default=default, description=desc)
+            int_type = int if is_required else Optional[int]
+            return int_type, Field(default=default, description=desc)
         if t == "number":
-            return float, Field(default=default, description=desc)
+            float_type = float if is_required else Optional[float]
+            return float_type, Field(default=default, description=desc)
         if t == "boolean":
-            return bool, Field(default=default, description=desc)
-        # Fallback or unions
-        if any(key in schema for key in ("oneOf", "anyOf", "allOf")):
-            self.logger.warning("Unsupported union schema in field %s; using Any", name)
+            bool_type = bool if is_required else Optional[bool]
+            return bool_type, Field(default=default, description=desc)
+        # anyOf / oneOf → Union (typing has no XOR, so oneOf also maps to
+        # Union). A `{"type": "null"}` branch — or an optional field — makes the
+        # result Optional. Each branch is converted recursively.
+        sub_schemas = schema.get("anyOf") or schema.get("oneOf")
+        if isinstance(sub_schemas, list) and sub_schemas:
+            non_null = [
+                s
+                for s in sub_schemas
+                if not (isinstance(s, dict) and s.get("type") == "null")
+            ]
+            has_null = len(non_null) != len(sub_schemas)
+            if non_null:
+                member_types = tuple(
+                    self._schema_to_field(
+                        name,
+                        s,
+                        prefix,
+                        is_required=True,
+                        defs=defs,
+                        ref_cache=ref_cache,
+                    )[0]
+                    for s in non_null
+                )
+                union_type = Union[member_types]  # type: ignore
+                if has_null or not is_required:
+                    union_type = Optional[union_type]  # type: ignore
+                return union_type, Field(default=default, description=desc)
+            if has_null:
+                return type(None), Field(default=default, description=desc)
+
+        # allOf: a single subschema is just that schema; a multi-schema
+        # intersection has no clean typing analogue, so fall back to Any.
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list) and len(all_of) == 1:
+            inner_type, _ = self._schema_to_field(
+                name,
+                all_of[0],
+                prefix,
+                is_required=is_required,
+                defs=defs,
+                ref_cache=ref_cache,
+            )
+            return inner_type, Field(default=default, description=desc)
+        if all_of:
+            self.logger.warning("Unsupported allOf schema in field %s; using Any", name)
             return Any, Field(default=default, description=desc)
+
         # Default fallback
         return Any, Field(default=default, description=desc)
 
@@ -195,14 +487,68 @@ class FastMCPClient:
         target = await self.get_mcp_tool_async(tool_name)
         if target is None:
             raise ValueError(f"No tool named {tool_name}")
-        props = target.inputSchema.get("properties", {})
+        return self.tool_model_from_mcp_tool(target)
+
+    def tool_model_from_mcp_tool(self, target: Tool) -> Type[ToolMessage]:
+        """
+        Build a Langroid ToolMessage subclass from an already-fetched MCP
+        `Tool` object.
+
+        This is a pure, synchronous, network-free conversion: it performs no
+        ``list_tools()`` round-trip. Pair it with a single ``list_tools()`` call
+        to build many tools without re-listing the server once per tool
+        (see :meth:`get_tools_async`).
+
+        Args:
+            target: The raw ``mcp.types.Tool`` (name, description, inputSchema).
+
+        Returns:
+            A dynamically created Langroid ToolMessage subclass for `target`.
+        """
+        mcp_tool_name = getattr(target, "name", None)
+        if not isinstance(mcp_tool_name, str) or mcp_tool_name == "":
+            raise ValueError(f"Invalid MCP tool name for tool {target!r}")
+        tool_name = (
+            f"{self.tool_name_prefix}__{mcp_tool_name}"
+            if self.tool_name_prefix is not None
+            else mcp_tool_name
+        )
+
+        input_schema = getattr(target, "inputSchema", None)
+        schema = input_schema if isinstance(input_schema, dict) else {}
+        props = schema.get("properties") or {}
+        if not isinstance(props, dict):
+            props = {}
+        # Registry of shared subschemas ($defs), used to resolve $ref nodes such
+        # as pydantic-model params. Captured before the loop below shadows
+        # `schema` with each property's schema.
+        defs = schema.get("$defs")
+        if not isinstance(defs, dict):
+            defs = {}
+        # Cache of resolved $ref types, shared across all properties so a def
+        # referenced by several params is built once and reused.
+        ref_cache: Dict[str, Any] = {}
+        # Get the list of required fields from JSON Schema
+        required_fields = schema.get("required") or []
+        if not isinstance(required_fields, list):
+            required_fields = []
+        required_field_names = {
+            name for name in required_fields if isinstance(name, str)
+        }
         fields: Dict[str, Tuple[type, Any]] = {}
         for fname, schema in props.items():
-            ftype, fld = self._schema_to_field(fname, schema, target.name)
+            ftype, fld = self._schema_to_field(
+                fname,
+                schema,
+                tool_name,
+                is_required=fname in required_field_names,
+                defs=defs,
+                ref_cache=ref_cache,
+            )
             fields[fname] = (ftype, fld)
 
         # Convert target.name to CamelCase and add Tool suffix
-        parts = target.name.replace("-", "_").split("_")
+        parts = tool_name.replace("-", "_").split("_")
         camel_case = "".join(part.capitalize() for part in parts)
         model_name = f"{camel_case}Tool"
 
@@ -229,15 +575,19 @@ class FastMCPClient:
             Type[ToolMessage],
             create_model(  # type: ignore[call-overload]
                 model_name,
-                request=(str, target.name),
-                purpose=(str, target.description or f"Use the tool {target.name}"),
+                request=(str, tool_name),
+                purpose=(
+                    str,
+                    getattr(target, "description", None) or f"Use the tool {tool_name}",
+                ),
                 __base__=ToolMessage,
                 **fields,
             ),
         )
         # Store ALL client configuration needed to recreate a client
         client_config = {
-            "server": self.server,
+            # Always store a SERVER FACTORY to ensure a fresh transport per call
+            "server": self._as_server_factory(self.server),
             "sampling_handler": self.sampling_handler,
             "roots": self.roots,
             "log_handler": self.log_handler,
@@ -247,6 +597,7 @@ class FastMCPClient:
 
         tool_model._client_config = client_config  # type: ignore [attr-defined]
         tool_model._renamed_fields = renamed  # type: ignore[attr-defined]
+        tool_model._mcp_tool_name = mcp_tool_name  # type: ignore[attr-defined]
 
         # 2) define an arg-free call_tool_async()
         async def call_tool_async(itself: ToolMessage) -> Any:
@@ -270,14 +621,17 @@ class FastMCPClient:
             # Add standard excluded fields
             exclude_fields.update(["request", "purpose"])
 
-            payload = itself.model_dump(exclude=exclude_fields)
+            # Exclude None values - MCP servers don't expect None for optional params
+            payload = itself.model_dump(exclude=exclude_fields, exclude_none=True)
 
             # restore any renamed fields
             for orig, new in itself.__class__._renamed_fields.items():  # type: ignore
                 if new in payload:
                     payload[orig] = payload.pop(new)
 
-            client_cfg = getattr(itself.__class__, "_client_config", None)  # type: ignore
+            client_cfg = getattr(  # type: ignore
+                itself.__class__, "_client_config", None
+            )
             if not client_cfg:
                 # Fallback or error - ideally _client_config should always exist
                 raise RuntimeError(f"Client config missing on {itself.__class__}")
@@ -287,11 +641,17 @@ class FastMCPClient:
                 if not self.client:
                     await self.connect()
 
-                return await self.call_mcp_tool(itself.request, payload)
+                return await self.call_mcp_tool(
+                    itself.__class__._mcp_tool_name,  # type: ignore[attr-defined]
+                    payload,
+                )
 
             # open a fresh client, call the tool, then close
             async with FastMCPClient(**client_cfg) as client:  # type: ignore
-                return await client.call_mcp_tool(itself.request, payload)
+                return await client.call_mcp_tool(
+                    itself.__class__._mcp_tool_name,  # type: ignore[attr-defined]
+                    payload,
+                )
 
         tool_model.call_tool_async = call_tool_async  # type: ignore
 
@@ -344,7 +704,7 @@ class FastMCPClient:
                     "Client not initialized. Use async with FastMCPClient."
                 )
         resp = await self.client.list_tools()
-        return [await self.get_tool_async(t.name) for t in resp]
+        return [self.tool_model_from_mcp_tool(t) for t in resp]
 
     async def get_mcp_tool_async(self, name: str) -> Optional[Tool]:
         """Find the "original" MCP Tool (i.e. of type mcp.types.Tool) on the server
@@ -368,6 +728,81 @@ class FastMCPClient:
         resp: List[Tool] = await self.client.list_tools()
         return next((t for t in resp if t.name == name), None)
 
+    @staticmethod
+    def _as_server_factory(
+        server: FastMCPServerSpec,
+    ) -> Callable[[], FastMCPServerConcrete]:
+        """Normalize a server spec to a zero-arg factory.
+
+        - If already callable, return as-is.
+        - If a ClientTransport instance, return a factory that yields the SAME
+          instance. This preserves state for keep-alive stdio transports (e.g.,
+          npx/uvx servers) so multi-call workflows can share process state.
+          Recreating a fresh transport each call would lose stateful servers
+          like `@modelcontextprotocol/server-memory` and break tests.
+        - Otherwise return a factory that yields the given spec.
+        """
+        if callable(server):  # type: ignore[arg-type]
+            return server  # type: ignore[return-value]
+
+        if isinstance(server, ClientTransport):
+            # Reuse policy split:
+            # - Npx/Uvx stdio transports: reuse the SAME instance to preserve
+            #   keep-alive subprocess state (stateful MCP servers).
+            # - Plain StdioTransport: CLONE a fresh transport to avoid reusing
+            #   process/pipes across decorator-time schema fetch and runtime calls
+            #   (some stdio servers close after first session, like CLI wrappers).
+            try:
+                if (
+                    not isinstance(NpxStdioTransport, tuple)
+                    and isinstance(server, NpxStdioTransport)
+                ) or (  # type: ignore[arg-type]
+                    not isinstance(UvxStdioTransport, tuple)
+                    and isinstance(server, UvxStdioTransport)
+                ):  # type: ignore[arg-type]
+                    return lambda: server
+            except Exception:
+                # If optional classes are tuples (import failed), fall through
+                pass
+
+            if isinstance(server, StdioTransport):
+                # Best‑effort clone with back‑compat: only pass kwargs supported
+                # by this installed fastmcp version's StdioTransport.__init__.
+                sig = inspect.signature(StdioTransport.__init__)
+                params = sig.parameters
+
+                def _pick(name: str, default: Any = None) -> Any:
+                    return getattr(server, name, default) if name in params else None
+
+                # Required in all known versions
+                cmd = getattr(server, "command", None)
+                args = list(getattr(server, "args", []) or [])
+
+                # Optional, filter by signature presence
+                env = _pick("env")
+                cwd = _pick("cwd")
+                keep_alive = _pick("keep_alive")
+                log_file = _pick("log_file")
+
+                def _factory() -> StdioTransport:
+                    kwargs = {"command": cmd, "args": args}
+                    if "env" in params and env is not None:
+                        kwargs["env"] = env
+                    if "cwd" in params and cwd is not None:
+                        kwargs["cwd"] = cwd
+                    if "keep_alive" in params and keep_alive is not None:
+                        kwargs["keep_alive"] = keep_alive
+                    if "log_file" in params and log_file is not None:
+                        kwargs["log_file"] = log_file
+                    return StdioTransport(**kwargs)  # type: ignore[arg-type]
+
+                return _factory
+
+            # Default for other ClientTransport types: reuse
+            return lambda: server
+
+        return lambda: server  # type: ignore[return-value]
+
     def _convert_tool_result(
         self,
         tool_name: str,
@@ -390,17 +825,20 @@ class FastMCPClient:
             )
             return f"ERROR: Tool call failed - {error_content}"
 
-        results_text = [
+        # 1) Collect any plain TextContent first. This preserves legacy behavior
+        # for simple servers that return only text. If we have text, prefer it
+        # over structuredContent to avoid surprising downstream code.
+        results_text: list[str] = [
             item.text for item in result.content if isinstance(item, TextContent)
         ]
-        results_file = []
+        results_file: list[FileAttachment] = []
 
+        # Also collect resources alongside text; callers may want them.
         for item in result.content:
             if isinstance(item, ImageContent) and self.forward_images:
                 results_file.append(
                     FileAttachment.from_bytes(
-                        b64decode(item.data),
-                        mime_type=item.mimeType,
+                        b64decode(item.data), mime_type=item.mimeType
                     )
                 )
             elif isinstance(item, EmbeddedResource):
@@ -420,7 +858,36 @@ class FastMCPClient:
                         )
                     )
 
-        return "\n".join(results_text), results_file
+        if results_text:
+            return "\n".join(results_text), results_file
+
+        # 2) No plain text — use structuredContent if available. To maintain
+        # backwards compatibility, unwrap simple shapes like {"result": 5}
+        # into "5"; otherwise serialize the full object as JSON for fidelity.
+        if result.structuredContent is not None:
+            sc = result.structuredContent
+            try:
+                # Unwrap primitives directly
+                if isinstance(sc, (str, int, float, bool)):
+                    return str(sc), results_file
+                # Unwrap single-key primitive dicts commonly used by tools
+                if (
+                    isinstance(sc, dict)
+                    and len(sc) == 1
+                    and next(iter(sc.values())) is not None
+                    and isinstance(next(iter(sc.values())), (str, int, float, bool))
+                ):
+                    return str(next(iter(sc.values()))), results_file
+
+                # Otherwise, serialize to JSON for rich/structured tools
+                import json
+
+                return json.dumps(sc, ensure_ascii=False), results_file
+            except Exception:
+                return str(sc), results_file
+
+        # 3) Nothing usable — return empty text and any files
+        return "", results_file
 
     async def call_mcp_tool(
         self, tool_name: str, arguments: Dict[str, Any]
@@ -442,10 +909,37 @@ class FastMCPClient:
                 raise RuntimeError(
                     "Client not initialized. Use async with FastMCPClient."
                 )
-        result: CallToolResult = await self.client.session.call_tool(
-            tool_name,
-            arguments,
-        )
+        # Prefer validated call; if server fails to provide structured content
+        # despite declaring a schema, fall back to a raw request to bypass
+        # client-side validation and still surface the data.
+        try:
+            result: CallToolResult = await self.client.session.call_tool(
+                tool_name,
+                arguments,
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "has an output schema but did not return structured content" not in msg:
+                raise
+            from mcp.types import (
+                CallToolRequest,
+                CallToolRequestParams,
+                ClientRequest,
+            )
+            from mcp.types import (
+                CallToolResult as _CallToolResult,
+            )
+
+            result = await self.client.session.send_request(  # type: ignore[assignment]
+                ClientRequest(
+                    CallToolRequest(
+                        params=CallToolRequestParams(
+                            name=tool_name, arguments=arguments
+                        )
+                    )
+                ),
+                _CallToolResult,
+            )
         results = self._convert_tool_result(tool_name, result)
 
         if isinstance(results, str):

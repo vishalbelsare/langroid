@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 from typing import List
 
@@ -46,6 +47,7 @@ class MyDocMetaData(DocMetaData):
 class MyDoc(Document):
     content: str
     metadata: MyDocMetaData
+    category: str = ""
 
 
 stored_docs = [
@@ -56,6 +58,9 @@ stored_docs = [
 
 @pytest.fixture(scope="function")
 def vecdb(request) -> VectorStore:
+    # Unique suffix per pytest-xdist worker so parallel workers don't collide
+    # on the same Qdrant collection in the shared local container (PR #1030).
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
     if request.param == "qdrant_local":
         qd_dir = ":memory:"
         qd_cfg = QdrantDBConfig(
@@ -73,7 +78,7 @@ def vecdb(request) -> VectorStore:
         qd_dir = ".qdrant/cloud/" + embed_cfg.model_type
         qd_cfg_cloud = QdrantDBConfig(
             cloud=True,
-            collection_name="test-" + embed_cfg.model_type,
+            collection_name=f"test-{embed_cfg.model_type}-{worker}",
             storage_path=qd_dir,
             embedding=embed_cfg,
         )
@@ -126,7 +131,7 @@ def vecdb(request) -> VectorStore:
         qd_dir = ".qdrant/cloud/" + embed_cfg.model_type
         qd_cfg_cloud = QdrantDBConfig(
             cloud=True,
-            collection_name="test-" + embed_cfg.model_type,
+            collection_name=f"test-hybrid-{embed_cfg.model_type}-{worker}",
             replace_collection=True,
             storage_path=qd_dir,
             embedding=embed_cfg,
@@ -419,7 +424,10 @@ def test_vector_stores_context_window(vecdb):
     parser = Parser(cfg)
     splits = parser.split([doc])
 
-    vecdb.create_collection(collection_name="testcw", replace=True)
+    vecdb.create_collection(
+        collection_name=f"testcw-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}",
+        replace=True,
+    )
     vecdb.add_documents(splits)
 
     # Test context window retrieval
@@ -455,7 +463,7 @@ def test_vector_stores_context_window(vecdb):
         pytest.param("pinecone_serverless", marks=pytest.mark.skip),
         "chroma",
         "lancedb",
-        # "postgres",
+        "postgres",
         "weaviate_docker",
     ],
     indirect=True,
@@ -554,7 +562,10 @@ def test_vector_stores_overlapping_matches(vecdb):
     parser = Parser(cfg)
     splits = parser.split([doc])
 
-    vecdb.create_collection(collection_name="testcw", replace=True)
+    vecdb.create_collection(
+        collection_name=f"testcw-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}",
+        replace=True,
+    )
     vecdb.add_documents(splits)
 
     # Test context window retrieval

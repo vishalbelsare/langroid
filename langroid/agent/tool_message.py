@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
 from docstring_parser import parse
 from pydantic import BaseModel, ConfigDict
+from pydantic.fields import ModelPrivateAttr
 
 from langroid.language_models.base import LLMFunctionSpec
 from langroid.utils.pydantic_utils import (
@@ -24,6 +25,35 @@ from langroid.utils.pydantic_utils import (
 from langroid.utils.types import is_instance_of
 
 K = TypeVar("K")
+
+
+def handler_name(message_class: Type["ToolMessage"], default: str) -> str:
+    """Name of the agent method that handles this tool class.
+
+    A tool may declare `_handler = "some_method"` to route itself to an
+    agent method whose name differs from the tool's `request` value. This
+    is a *class*-level declaration and must be resolved from the class:
+    `ToolMessage` sets `extra="allow"`, so an LLM-supplied `"_handler"`
+    key in tool JSON lands on the instance, and reading it from there
+    would let a tool call redirect dispatch to an arbitrary agent method
+    (issue #1106).
+
+    Pydantic v2 represents a class-level underscore attribute as a
+    `ModelPrivateAttr`, so unwrap that to get the declared name.
+
+    Args:
+        message_class: The tool class to read the declaration from.
+        default: Name to use when the class declares no usable `_handler`.
+
+    Returns:
+        The declared handler-method name, else `default`.
+    """
+    declared: Any = getattr(message_class, "_handler", None)
+    if isinstance(declared, ModelPrivateAttr):
+        declared = declared.default
+    if isinstance(declared, str) and declared:
+        return declared
+    return default
 
 
 def remove_if_exists(k: K, d: dict[K, Any]) -> None:
@@ -105,6 +135,14 @@ class ToolMessage(ABC, BaseModel):
     _strict: Optional[bool] = None
     _allow_llm_use: bool = True  # allow an LLM to use (i.e. generate) this tool?
 
+    # DISTRUST mark (#1035): True when this tool object was parsed out of
+    # tainted (external-USER-derived) content, or repackages such a tool.
+    # A private attr, so it never appears in LLM-facing schemas or serialized
+    # JSON, and it survives copy.deepcopy (hence ChatDocument.deepcopy).
+    # Read via getattr(t, "_tainted", False) in Agent.response_template and
+    # Agent._filter_user_origin_tools; stamped in Agent.get_tool_messages.
+    _tainted: bool = False
+
     # Optional param to limit number of result tokens to retain in msg history.
     # Some tools can have large results that we may not want to fully retain,
     # e.g. result of a db query, which the LLM later reduces to a summary, so
@@ -162,6 +200,7 @@ class ToolMessage(ABC, BaseModel):
     def require_recipient(cls) -> Type["ToolMessage"]:
         class ToolMessageWithRecipient(cls):  # type: ignore
             recipient: str  # no default, so it is required
+            __tool_message_origin__ = cls.__dict__.get("__tool_message_origin__", cls)
 
         return ToolMessageWithRecipient
 
@@ -364,9 +403,13 @@ class ToolMessage(ABC, BaseModel):
                     f"the required parameters with correct types"
                 )
 
-        # Handle nested ToolMessage fields
-        if "definitions" in parameters:
-            for v in parameters["definitions"].values():
+        # Handle nested ToolMessage fields.
+        # NOTE: Pydantic v1 emitted nested-model schemas under "definitions";
+        # v2's model_json_schema() emits them under "$defs". This must track the
+        # v2 key or the cleanup below silently no-ops (leaking purpose/id/exclude
+        # and an unconstrained request into the nested schema sent to the LLM).
+        if "$defs" in parameters:
+            for v in parameters["$defs"].values():
                 if "exclude" in v:
                     v.pop("exclude")
 

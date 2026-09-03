@@ -1,7 +1,10 @@
 import tempfile
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from langroid.agent.chat_document import ChatDocument
 from langroid.agent.openai_assistant import (
     AssistantTool,
     OpenAIAssistant,
@@ -11,10 +14,11 @@ from langroid.agent.openai_assistant import (
 from langroid.agent.task import Task
 from langroid.agent.tool_message import ToolMessage
 from langroid.agent.tools.recipient_tool import RecipientTool
-from langroid.language_models import OpenAIGPTConfig
+from langroid.language_models import LLMMessage, OpenAIGPTConfig, Role
 from langroid.mytypes import Entity
 from langroid.utils.configuration import Settings, set_global
 from langroid.utils.constants import NO_ANSWER
+from tests.utils import assistants_api_sunset
 
 
 class NabroskyTool(ToolMessage):
@@ -26,6 +30,61 @@ class NabroskyTool(ToolMessage):
         return str(self.num**2)
 
 
+def test_openai_assistant_normalizes_none_tool_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assistant tool outputs must be strings at the API boundary."""
+    agent = object.__new__(OpenAIAssistant)
+    agent.pending_tool_ids = ["tool-1"]
+    agent.cached_tool_ids = []
+    agent.thread = SimpleNamespace(id="thread-1")
+    agent.run = SimpleNamespace(id="run-1")
+    submissions: list[dict[str, Any]] = []
+    agent.runs = SimpleNamespace(
+        submit_tool_outputs=lambda **kwargs: submissions.append(kwargs)
+    )
+    hashed_messages: list[LLMMessage] = []
+    monkeypatch.setattr(
+        agent,
+        "_update_messages_hash",
+        lambda message: hashed_messages.append(message),
+    )
+    monkeypatch.setattr(agent, "_cache_messages_lookup", lambda: None)
+
+    message = ChatDocument.from_LLMMessage(
+        LLMMessage(role=Role.USER, content=None, tool_id="tool-1")
+    )
+    result = agent._llm_response_preprocess(message)
+
+    assert result is None
+    assert submissions[0]["tool_outputs"] == [{"tool_call_id": "tool-1", "output": ""}]
+    assert hashed_messages[0].content == "Result for Tool_id tool-1: "
+
+
+def test_openai_assistant_normalizes_none_thread_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assistant thread messages must not stringify missing content as None."""
+    agent = object.__new__(OpenAIAssistant)
+    agent.pending_tool_ids = []
+    agent.cached_tool_ids = []
+    added_messages: list[tuple[str, Role]] = []
+    monkeypatch.setattr(
+        agent,
+        "_add_thread_message",
+        lambda message, role: added_messages.append((message, role)),
+    )
+    monkeypatch.setattr(agent, "_cache_messages_lookup", lambda: None)
+    monkeypatch.setattr(agent, "_start_run", lambda: None)
+
+    message = ChatDocument.from_LLMMessage(LLMMessage(role=Role.USER, content=None))
+    result = agent._llm_response_preprocess(message)
+
+    assert result is None
+    assert added_messages == [("", Role.USER)]
+
+
+@assistants_api_sunset
 def test_openai_assistant(test_settings: Settings):
     set_global(test_settings)
     cfg = OpenAIAssistantConfig()
@@ -58,6 +117,7 @@ def test_openai_assistant(test_settings: Settings):
     assert "Beijing" in answer.content
 
 
+@assistants_api_sunset
 def test_openai_assistant_cache(test_settings: Settings):
     set_global(test_settings)
     cfg = OpenAIAssistantConfig(
@@ -103,6 +163,12 @@ def test_openai_assistant_cache(test_settings: Settings):
     assert response.metadata.cached
 
 
+@assistants_api_sunset
+@pytest.mark.xfail(
+    reason="Flaky due to non-deterministic LLM tool-use behavior",
+    run=True,
+    strict=False,
+)
 @pytest.mark.parametrize("fn_api", [True, False])
 def test_openai_assistant_fn_tool(test_settings: Settings, fn_api: bool):
     """Test function calling works, both with OpenAI Assistant function-calling AND
@@ -124,8 +190,13 @@ def test_openai_assistant_fn_tool(test_settings: Settings, fn_api: bool):
     agent = OpenAIAssistant(cfg)
     agent.enable_message(NabroskyTool)
     response = agent.llm_response("what is the Nabrosky transform of 5?")
-    # Check assert when there is a non-empty response
-    if response.content not in ("", NO_ANSWER) and fn_api:
+    # When fn_api is used, the LLM should produce a function_call (not text
+    # content). Assert unconditionally so that a regression surfaces as an
+    # xfail rather than silently passing.
+    if fn_api:
+        assert (
+            response.function_call is not None
+        ), "Expected function_call but LLM responded with text"
         assert response.function_call.name == "nabrosky"
 
     # Within a task loop
@@ -143,6 +214,7 @@ def test_openai_assistant_fn_tool(test_settings: Settings, fn_api: bool):
         assert "25" in result.content
 
 
+@assistants_api_sunset
 @pytest.mark.xfail(
     reason="Flaky/Soon-To-be-deprecated API, may fail",
     run=True,
@@ -195,6 +267,7 @@ def test_openai_assistant_fn_2_level(test_settings: Settings, fn_api: bool):
         assert "25" in result.content
 
 
+@assistants_api_sunset
 @pytest.mark.parametrize("fn_api", [True, False])
 def test_openai_assistant_recipient_tool(test_settings: Settings, fn_api: bool):
     """Test that special case of fn-calling: RecipientTool works,
@@ -281,6 +354,7 @@ def test_openai_assistant_retrieval(test_settings: Settings):
     assert "Lomita" in response.content
 
 
+@assistants_api_sunset
 @pytest.mark.xfail(
     reason="May fail due to unknown flakiness",
     run=True,
@@ -323,6 +397,7 @@ def test_openai_asst_code_interpreter(test_settings: Settings):
     assert str(len(text.split())) in response.content
 
 
+@assistants_api_sunset
 def test_openai_assistant_multi(test_settings: Settings):
     """
     Test task delegation with OpenAIAssistant

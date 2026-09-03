@@ -55,10 +55,12 @@ from langroid.language_models.client_cache import (
     get_cerebras_client,
     get_groq_client,
     get_openai_client,
+    wrap_api_key_provider_async,
 )
 from langroid.language_models.config import HFPromptFormatterConfig
 from langroid.language_models.model_info import (
     DeepSeekModel,
+    MiniMaxModel,
     OpenAI_API_ParamInfo,
 )
 from langroid.language_models.model_info import (
@@ -95,7 +97,10 @@ else:
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+# Provider prefixes that route to the Gemini OpenAI-compatible API.
+GEMINI_MODEL_PREFIXES = ("gemini/", "google/gemini-")
 GLHF_BASE_URL = "https://glhf.chat/api/openai/v1"
+MINIMAX_BASE_URL = "https://api.minimax.io/v1"
 OLLAMA_API_KEY = "ollama"
 
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY", DUMMY_API_KEY)
@@ -254,6 +259,15 @@ class OpenAIGPTConfig(LLMConfig):
 
     type: str = "openai"
     api_key: str = DUMMY_API_KEY
+    # Callable returning a fresh API key/bearer token, for endpoints that
+    # authenticate with short-lived rotating credentials (e.g. Vertex AI
+    # OAuth tokens, Azure Entra ID). Resolved per-request by the OpenAI
+    # client, and excluded from the client-cache key (the cache is keyed on
+    # the provider's identity), so rotating tokens neither go stale nor grow
+    # the cache. Takes precedence over `api_key`. Only supported for models
+    # served via an OpenAI-compatible endpoint (not Groq/Cerebras/litellm).
+    # See docs/notes/rotating-api-keys.md.
+    api_key_provider: Optional[Callable[[], str]] = None
     organization: str = ""
     api_base: str | None = None  # used for local or other non-OpenAI models
     litellm: bool = False  # use litellm api?
@@ -270,7 +284,7 @@ class OpenAIGPTConfig(LLMConfig):
     )
     # these can be any model name that is served at an OpenAI-compatible API end point
     chat_model: str = default_openai_chat_model
-    chat_model_orig: str = default_openai_chat_model
+    chat_model_orig: Optional[str] = None
     completion_model: str = default_openai_completion_model
     run_on_first_use: Callable[[], None] = noop
     parallel_tool_calls: Optional[bool] = None
@@ -288,11 +302,15 @@ class OpenAIGPTConfig(LLMConfig):
     langdb_params: LangDBParams = LangDBParams()
     portkey_params: PortkeyParams = PortkeyParams()
     headers: Dict[str, str] = {}
-    http_client_factory: Optional[Callable[[], Any]] = None  # Factory for httpx.Client
+    http_client_factory: Optional[Callable[[], Any]] = (
+        None  # Factory: returns Client or (Client, AsyncClient)
+    )
     http_verify_ssl: bool = True  # Simple flag for SSL verification
     http_client_config: Optional[Dict[str, Any]] = None  # Config dict for httpx.Client
+    _api_base_was_supplied: bool = False
 
     def __init__(self, **kwargs) -> None:  # type: ignore
+        api_base_was_supplied = "api_base" in kwargs
         local_model = "api_base" in kwargs and kwargs["api_base"] is not None
 
         chat_model = kwargs.get("chat_model", "")
@@ -316,8 +334,27 @@ class OpenAIGPTConfig(LLMConfig):
             kwargs["run_on_first_use"] = with_warning
 
         super().__init__(**kwargs)
+        env_prefix = self.model_config.get("env_prefix")
+        env_api_base_name = f"{env_prefix}API_BASE"
+        env_api_base = os.getenv(env_api_base_name)
+        if not self.model_config.get("case_sensitive"):
+            case_insensitive_env = {
+                name.lower(): value for name, value in os.environ.items()
+            }
+            env_api_base = case_insensitive_env.get(env_api_base_name.lower())
+        api_base_was_supplied = api_base_was_supplied or (
+            self.api_base is not None
+            and (env_prefix != "OPENAI_" or self.api_base != env_api_base)
+        )
+        self._api_base_was_supplied = api_base_was_supplied
 
     model_config = SettingsConfigDict(env_prefix="OPENAI_")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Track API bases assigned after config construction."""
+        super().__setattr__(name, value)
+        if name == "api_base":
+            self._api_base_was_supplied = True
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
@@ -329,9 +366,15 @@ class OpenAIGPTConfig(LLMConfig):
         models to their annotated base types (dropping subclass-only fields).
         Instead, defer to Pydantic's native `model_copy`, which keeps nested
         `BaseModel` instances (and their concrete subclasses) intact.
+
+        An `api_base` supplied through `update` is caller configuration, so the
+        copy must retain that provenance for provider-specific routing.
         """
         # Delegate to BaseSettings/BaseModel implementation to preserve types
-        return super().model_copy(update=update, deep=deep)  # type: ignore[return-value]
+        copied = super().model_copy(update=update, deep=deep)
+        if update is not None and "api_base" in update:
+            copied._api_base_was_supplied = True
+        return copied  # type: ignore[return-value]
 
     def _validate_litellm(self) -> None:
         """
@@ -421,13 +464,22 @@ class OpenAIGPT(LanguageModel):
         """
         # copy the config to avoid modifying the original; deep to decouple
         # nested models while preserving their concrete subclasses
+        # The api_key_provider must NOT be deep-copied: the client cache is
+        # keyed on its identity (so a copy would defeat cache sharing), and it
+        # may hold non-copyable state (e.g. a threading.Lock). Clear it in a
+        # shallow copy first, then restore the original callable afterwards.
+        api_key_provider = config.api_key_provider
+        if api_key_provider is not None:
+            config = config.model_copy(update={"api_key_provider": None})
         config = config.model_copy(deep=True)
+        if api_key_provider is not None:
+            config.api_key_provider = api_key_provider
         super().__init__(config)
         self.config: OpenAIGPTConfig = config
         # save original model name such as `provider/model` before
         # we strip out the `provider` - we retain the original in
         # case some params are specific to a provider.
-        self.chat_model_orig = self.config.chat_model
+        self.chat_model_orig = self.config.chat_model_orig or self.config.chat_model
 
         # Run the first time the model is used
         self.run_on_first_use = cache(self.config.run_on_first_use)
@@ -546,11 +598,21 @@ class OpenAIGPT(LanguageModel):
         self.is_cerebras = self.config.chat_model.startswith("cerebras/")
         self.is_gemini = self.is_gemini_model()
         self.is_deepseek = self.is_deepseek_model()
+        self.is_minimax = self.is_minimax_model()
         self.is_glhf = self.config.chat_model.startswith("glhf/")
         self.is_openrouter = self.config.chat_model.startswith("openrouter/")
         self.is_langdb = self.config.chat_model.startswith("langdb/")
         self.is_portkey = self.config.chat_model.startswith("portkey/")
         self.is_litellm_proxy = self.config.chat_model.startswith("litellm-proxy/")
+
+        if self.config.api_key_provider is not None and (
+            self.is_groq or self.is_cerebras or self.config.litellm
+        ):
+            raise ValueError(
+                "api_key_provider is only supported for models served via an "
+                "OpenAI-compatible endpoint (using the OpenAI client); it "
+                "cannot be used with Groq, Cerebras, or the litellm adapter."
+            )
 
         if self.is_groq:
             # use groq-specific client
@@ -587,10 +649,19 @@ class OpenAIGPT(LanguageModel):
                     self.api_key = self.config.litellm_proxy.api_key or self.api_key
                 self.api_base = self.config.litellm_proxy.api_base or self.api_base
             elif self.is_gemini:
-                self.config.chat_model = self.config.chat_model.replace("gemini/", "")
                 if self.api_key == OPENAI_API_KEY:
                     self.api_key = os.getenv("GEMINI_API_KEY", DUMMY_API_KEY)
-                self.api_base = GEMINI_BASE_URL
+                # Prefer caller config, then Gemini env, then the default.
+                gemini_api_base = os.getenv("GEMINI_API_BASE", "")
+                explicit_api_base = (
+                    self.config.api_base if self.config._api_base_was_supplied else None
+                )
+                self.api_base = explicit_api_base or gemini_api_base or GEMINI_BASE_URL
+                if (
+                    self.config.chat_model.startswith("gemini/")
+                    or self.api_base == GEMINI_BASE_URL
+                ):
+                    self.config.chat_model = self.config.chat_model.split("/", 1)[1]
             elif self.is_glhf:
                 self.config.chat_model = self.config.chat_model.replace("glhf/", "")
                 if self.api_key == OPENAI_API_KEY:
@@ -608,6 +679,28 @@ class OpenAIGPT(LanguageModel):
                 self.api_base = DEEPSEEK_BASE_URL
                 if self.api_key == OPENAI_API_KEY:
                     self.api_key = os.getenv("DEEPSEEK_API_KEY", DUMMY_API_KEY)
+            elif self.is_minimax:
+                self.config.chat_model = self.config.chat_model.replace("minimax/", "")
+                # Honor caller-supplied base URL (e.g. regional endpoints,
+                # proxies) instead of always forcing the default.
+                openai_api_base = os.getenv("OPENAI_API_BASE")
+                explicit_api_base = (
+                    self.config.api_base
+                    if self.config.api_base and self.config.api_base != openai_api_base
+                    else None
+                )
+                self.api_base = explicit_api_base or MINIMAX_BASE_URL
+                if self.api_key == OPENAI_API_KEY:
+                    # Only overwrite with MINIMAX_API_KEY when it is actually
+                    # set, so users who intentionally put their MiniMax key in
+                    # OPENAI_API_KEY are not silently downgraded to a dummy key.
+                    minimax_key = os.getenv("MINIMAX_API_KEY", "")
+                    if minimax_key:
+                        self.api_key = minimax_key
+                # Recompute capabilities now that the prefix has been stripped
+                # and self.info() can find the model in MODEL_INFO.
+                self.supports_strict_tools = True
+                self.supports_json_schema = self.info().has_structured_output
             elif self.is_langdb:
                 self.config.chat_model = self.config.chat_model.replace("langdb/", "")
                 self.api_base = self.config.langdb_params.base_url
@@ -648,6 +741,10 @@ class OpenAIGPT(LanguageModel):
                 # Add Portkey-specific headers
                 self.config.headers.update(self.config.portkey_params.get_headers())
 
+            # Sanitize the API key: strip leading/trailing whitespace
+            # (including stray newlines from .env files or CI secrets).
+            self.api_key = self.api_key.strip()
+
             # Create http_client if needed - Priority order:
             # 1. http_client_factory (most flexibility, not cacheable)
             # 2. http_client_config (cacheable, moderate flexibility)
@@ -659,9 +756,18 @@ class OpenAIGPT(LanguageModel):
             if self.config.http_client_factory is not None:
                 # Use the factory to create http_client (not cacheable)
                 http_client = self.config.http_client_factory()
-                # Don't set async_http_client from sync client - create separately
-                # This avoids type mismatch issues
-                async_http_client = None
+                if isinstance(http_client, (list, tuple)):
+                    if len(http_client) != 2:
+                        raise ValueError(
+                            "http_client_factory must return either a single "
+                            "httpx.Client or a tuple of "
+                            "(httpx.Client, httpx.AsyncClient)"
+                        )
+                    http_client, async_http_client = http_client
+                else:
+                    # set async_http_client to None - so that it will
+                    # be created later
+                    async_http_client = None
             elif self.config.http_client_config is not None:
                 # Use config dict (cacheable)
                 http_client_config_used = self.config.http_client_config
@@ -674,9 +780,17 @@ class OpenAIGPT(LanguageModel):
                     "corporate networks with self-signed certificates)."
                 )
 
+            # With an api_key_provider, hand the callable itself to the
+            # OpenAI client, which resolves a fresh token on each request.
+            openai_api_key: Union[str, Callable[[], str]] = (
+                self.config.api_key_provider
+                if self.config.api_key_provider is not None
+                else self.api_key
+            )
+
             if self.config.use_cached_client:
                 self.client = get_openai_client(
-                    api_key=self.api_key,
+                    api_key=openai_api_key,
                     base_url=self.api_base,
                     organization=self.config.organization,
                     timeout=Timeout(self.config.timeout),
@@ -685,7 +799,7 @@ class OpenAIGPT(LanguageModel):
                     http_client_config=http_client_config_used,
                 )
                 self.async_client = get_async_openai_client(
-                    api_key=self.api_key,
+                    api_key=openai_api_key,
                     base_url=self.api_base,
                     organization=self.config.organization,
                     timeout=Timeout(self.config.timeout),
@@ -696,7 +810,7 @@ class OpenAIGPT(LanguageModel):
             else:
                 # Create new clients without caching
                 client_kwargs: Dict[str, Any] = dict(
-                    api_key=self.api_key,
+                    api_key=openai_api_key,
                     base_url=self.api_base,
                     organization=self.config.organization,
                     timeout=Timeout(self.config.timeout),
@@ -718,7 +832,12 @@ class OpenAIGPT(LanguageModel):
                 self.client = OpenAI(**client_kwargs)
 
                 async_client_kwargs: Dict[str, Any] = dict(
-                    api_key=self.api_key,
+                    api_key=(
+                        # AsyncOpenAI awaits its api_key callable
+                        wrap_api_key_provider_async(openai_api_key)
+                        if callable(openai_api_key)
+                        else openai_api_key
+                    ),
                     base_url=self.api_base,
                     organization=self.config.organization,
                     timeout=Timeout(self.config.timeout),
@@ -794,7 +913,7 @@ class OpenAIGPT(LanguageModel):
 
     def is_gemini_model(self) -> bool:
         """Are we using the gemini OpenAI-compatible API?"""
-        return self.chat_model_orig.startswith("gemini/")
+        return self.chat_model_orig.startswith(GEMINI_MODEL_PREFIXES)
 
     def is_deepseek_model(self) -> bool:
         deepseek_models = [e.value for e in DeepSeekModel]
@@ -803,17 +922,19 @@ class OpenAIGPT(LanguageModel):
             or self.chat_model_orig.startswith("deepseek/")
         )
 
+    def is_minimax_model(self) -> bool:
+        """Are we using the MiniMax OpenAI-compatible API?"""
+        minimax_models = [e.value for e in MiniMaxModel]
+        return (
+            self.chat_model_orig in minimax_models
+            or self.chat_model_orig.startswith("minimax/")
+        )
+
     def unsupported_params(self) -> List[str]:
         """
         List of params that are not supported by the current model
         """
         unsupported = set(self.info().unsupported_params)
-        for param, model_list in OpenAI_API_ParamInfo().params.items():
-            if (
-                self.config.chat_model not in model_list
-                and self.chat_model_orig not in model_list
-            ):
-                unsupported.add(param)
         return list(unsupported)
 
     def rename_params(self) -> Dict[str, str]:
@@ -874,6 +995,49 @@ class OpenAIGPT(LanguageModel):
         """Get streaming status."""
         return self.config.stream and settings.stream and self.info().allows_streaming
 
+    @staticmethod
+    def _split_inline_reasoning(
+        event_text: str,
+        event_reasoning: str,
+        in_reasoning: bool,
+        thought_delimiters: Tuple[str, str],
+    ) -> Tuple[str, str, bool]:
+        """Separate inline reasoning from text tokens in a streaming chunk.
+
+        When models embed thinking inside content (e.g. <think>...</think>)
+        rather than using a separate reasoning field, this splits the chunk
+        into text-only and reasoning-only portions for proper streamer routing.
+
+        Returns (text_tokens, reasoning_tokens, in_reasoning).
+        """
+        text_tokens = event_text
+        reasoning_tokens = event_reasoning
+
+        if not event_text or event_reasoning:
+            return text_tokens, reasoning_tokens, in_reasoning
+
+        start, end = thought_delimiters
+        remaining = event_text
+
+        if in_reasoning:
+            text_tokens = ""
+        elif start in event_text:
+            before, _, after = event_text.partition(start)
+            text_tokens = before
+            remaining = after
+            in_reasoning = True
+
+        if in_reasoning:
+            if end in remaining:
+                before, _, after = remaining.partition(end)
+                text_tokens += after
+                reasoning_tokens = before
+                in_reasoning = False
+            else:
+                reasoning_tokens = remaining
+
+        return text_tokens, reasoning_tokens, in_reasoning
+
     @no_type_check
     def _process_stream_event(
         self,
@@ -885,7 +1049,8 @@ class OpenAIGPT(LanguageModel):
         reasoning: str = "",
         function_args: str = "",
         function_name: str = "",
-    ) -> Tuple[bool, bool, str, str, Dict[str, int]]:
+        in_reasoning: bool = False,
+    ) -> Tuple[bool, bool, str, str, bool, Dict[str, int]]:
         """Process state vars while processing a streaming API response.
             Returns a tuple consisting of:
         - is_break: whether to break out of the loop
@@ -916,6 +1081,7 @@ class OpenAIGPT(LanguageModel):
                 function_args,
                 completion,
                 reasoning,
+                in_reasoning,
                 usage,
             )
         event_args = ""
@@ -925,7 +1091,7 @@ class OpenAIGPT(LanguageModel):
         # The first two events in the stream of Azure OpenAI is useless.
         # In the 1st: choices list is empty, in the 2nd: the dict delta has null content
         if chat:
-            delta = choices[0].get("delta", {})
+            delta = choices[0].get("delta", {}) or {}
             # capture both content and reasoning_content
             event_text = delta.get("content", "")
             event_reasoning = delta.get(
@@ -959,18 +1125,31 @@ class OpenAIGPT(LanguageModel):
             )
             logging.warning("LLM API returned content filter error: " + event_text)
 
+        event_text_tokens, event_reasoning_tokens, in_reasoning = (
+            self._split_inline_reasoning(
+                event_text,
+                event_reasoning,
+                in_reasoning,
+                self.config.thought_delimiters,
+            )
+        )
+
         if event_text:
             completion += event_text
+        if event_text_tokens:
             if not silent:
-                sys.stdout.write(Colors().GREEN + event_text)
+                sys.stdout.write(Colors().GREEN + event_text_tokens)
                 sys.stdout.flush()
-            self.config.streamer(event_text, StreamEventType.TEXT)
+            self.config.streamer(event_text_tokens, StreamEventType.TEXT)
+
         if event_reasoning:
             reasoning += event_reasoning
+        if event_reasoning_tokens:
             if not silent:
-                sys.stdout.write(Colors().GREEN_DIM + event_reasoning)
+                sys.stdout.write(Colors().GREEN_DIM + event_reasoning_tokens)
                 sys.stdout.flush()
-            self.config.streamer(event_reasoning, StreamEventType.TEXT)
+            self.config.streamer(event_reasoning_tokens, StreamEventType.REASONING)
+
         if event_fn_name:
             function_name = event_fn_name
             has_function = True
@@ -1020,6 +1199,7 @@ class OpenAIGPT(LanguageModel):
             function_args,
             completion,
             reasoning,
+            in_reasoning,
             usage,
         )
 
@@ -1034,7 +1214,8 @@ class OpenAIGPT(LanguageModel):
         reasoning: str = "",
         function_args: str = "",
         function_name: str = "",
-    ) -> Tuple[bool, bool, str, str]:
+        in_reasoning: bool = False,
+    ) -> Tuple[bool, bool, str, str, bool, Dict[str, int]]:
         """Process state vars while processing a streaming API response.
             Returns a tuple consisting of:
         - is_break: whether to break out of the loop
@@ -1063,6 +1244,7 @@ class OpenAIGPT(LanguageModel):
                 function_args,
                 completion,
                 reasoning,
+                in_reasoning,
                 usage,
             )
         event_args = ""
@@ -1072,7 +1254,7 @@ class OpenAIGPT(LanguageModel):
         # The first two events in the stream of Azure OpenAI is useless.
         # In the 1st: choices list is empty, in the 2nd: the dict delta has null content
         if chat:
-            delta = choices[0].get("delta", {})
+            delta = choices[0].get("delta", {}) or {}
             event_text = delta.get("content", "")
             event_reasoning = delta.get(
                 "reasoning_content",
@@ -1090,18 +1272,34 @@ class OpenAIGPT(LanguageModel):
         else:
             event_text = choices[0]["text"]
             event_reasoning = ""  # TODO: Ignoring reasoning for non-chat models
+
+        event_text_tokens, event_reasoning_tokens, in_reasoning = (
+            self._split_inline_reasoning(
+                event_text,
+                event_reasoning,
+                in_reasoning,
+                self.config.thought_delimiters,
+            )
+        )
+
         if event_text:
             completion += event_text
+        if event_text_tokens:
             if not silent:
-                sys.stdout.write(Colors().GREEN + event_text)
+                sys.stdout.write(Colors().GREEN + event_text_tokens)
                 sys.stdout.flush()
-            await self.config.streamer_async(event_text, StreamEventType.TEXT)
+            await self.config.streamer_async(event_text_tokens, StreamEventType.TEXT)
+
         if event_reasoning:
             reasoning += event_reasoning
+        if event_reasoning_tokens:
             if not silent:
-                sys.stdout.write(Colors().GREEN + event_reasoning)
+                sys.stdout.write(Colors().GREEN_DIM + event_reasoning_tokens)
                 sys.stdout.flush()
-            await self.config.streamer_async(event_reasoning, StreamEventType.TEXT)
+            await self.config.streamer_async(
+                event_reasoning_tokens, StreamEventType.REASONING
+            )
+
         if event_fn_name:
             function_name = event_fn_name
             has_function = True
@@ -1155,6 +1353,7 @@ class OpenAIGPT(LanguageModel):
             function_args,
             completion,
             reasoning,
+            in_reasoning,
             usage,
         )
 
@@ -1184,8 +1383,17 @@ class OpenAIGPT(LanguageModel):
         tool_deltas: List[Dict[str, Any]] = []
         token_usage: Dict[str, int] = {}
         done: bool = False
+        in_reasoning: bool = False  # Track if we're inside reasoning delimiters
+        content_present = False
         try:
             for event in response:
+                event_dict = event if isinstance(event, dict) else event.model_dump()
+                choices = event_dict.get("choices") or []
+                if chat and choices:
+                    delta = choices[0].get("delta") or {}
+                    content_present = content_present or (
+                        "content" in delta and delta["content"] is not None
+                    )
                 (
                     is_break,
                     has_function,
@@ -1193,6 +1401,7 @@ class OpenAIGPT(LanguageModel):
                     function_args,
                     completion,
                     reasoning,
+                    in_reasoning,
                     usage,
                 ) = self._process_stream_event(
                     event,
@@ -1203,6 +1412,7 @@ class OpenAIGPT(LanguageModel):
                     reasoning=reasoning,
                     function_args=function_args,
                     function_name=function_name,
+                    in_reasoning=in_reasoning,
                 )
                 if len(usage) > 0:
                     # capture the token usage when non-empty
@@ -1231,6 +1441,7 @@ class OpenAIGPT(LanguageModel):
             function_args=function_args,
             function_name=function_name,
             usage=token_usage,
+            content_present=content_present,
         )
 
     @async_retry_with_exponential_backoff
@@ -1260,8 +1471,17 @@ class OpenAIGPT(LanguageModel):
         tool_deltas: List[Dict[str, Any]] = []
         token_usage: Dict[str, int] = {}
         done: bool = False
+        in_reasoning: bool = False  # Track if we're inside reasoning delimiters
+        content_present = False
         try:
             async for event in response:
+                event_dict = event if isinstance(event, dict) else event.model_dump()
+                choices = event_dict.get("choices") or []
+                if chat and choices:
+                    delta = choices[0].get("delta") or {}
+                    content_present = content_present or (
+                        "content" in delta and delta["content"] is not None
+                    )
                 (
                     is_break,
                     has_function,
@@ -1269,6 +1489,7 @@ class OpenAIGPT(LanguageModel):
                     function_args,
                     completion,
                     reasoning,
+                    in_reasoning,
                     usage,
                 ) = await self._process_stream_event_async(
                     event,
@@ -1279,6 +1500,7 @@ class OpenAIGPT(LanguageModel):
                     reasoning=reasoning,
                     function_args=function_args,
                     function_name=function_name,
+                    in_reasoning=in_reasoning,
                 )
                 if len(usage) > 0:
                     # capture the token usage when non-empty
@@ -1307,6 +1529,7 @@ class OpenAIGPT(LanguageModel):
             function_args=function_args,
             function_name=function_name,
             usage=token_usage,
+            content_present=content_present,
         )
 
     @staticmethod
@@ -1341,6 +1564,7 @@ class OpenAIGPT(LanguageModel):
                 "id": None,
                 "function": {"arguments": "", "name": None},
                 "type": None,
+                "extra_content": None,
             }
         )
 
@@ -1359,6 +1583,11 @@ class OpenAIGPT(LanguageModel):
 
             if tool_delta["type"] is not None:
                 idx2tool_dict[tool_delta["index"]]["type"] = tool_delta["type"]
+
+            if tool_delta.get("extra_content") is not None:
+                idx2tool_dict[tool_delta["index"]]["extra_content"] = tool_delta[
+                    "extra_content"
+                ]
 
         # (try to) parse the fn args of each tool
         contents: List[str] = []
@@ -1391,6 +1620,7 @@ class OpenAIGPT(LanguageModel):
                     arguments=id2args.get(tool_dict["id"]),
                 ),
                 type=tool_dict["type"],
+                extra_content=tool_dict.get("extra_content"),
             )
             for tool_dict in idx2tool_dict.values()
         ]
@@ -1445,6 +1675,7 @@ class OpenAIGPT(LanguageModel):
         function_args: str = "",
         function_name: str = "",
         usage: Dict[str, int] = {},
+        content_present: bool = False,
     ) -> Tuple[LLMResponse, Dict[str, Any]]:
         """
         Create an LLMResponse object from the streaming API response.
@@ -1458,6 +1689,7 @@ class OpenAIGPT(LanguageModel):
             function_args: string representing function args
             function_name: name of the function
             usage: token usage dict
+            content_present: whether a stream delta explicitly contained content
         Returns:
             Tuple consisting of:
                 LLMResponse object (with message, usage),
@@ -1479,10 +1711,18 @@ class OpenAIGPT(LanguageModel):
             failed_content, tool_calls, tool_dicts = OpenAIGPT.tool_deltas_to_tools(
                 tool_deltas,
             )
-            completion = completion + "\n" + failed_content
+            if failed_content:
+                completion += ("\n" if completion else "") + failed_content
+                content_present = True
+            has_valid_call = len(tool_dicts) > 0 or has_function
+            response_content = (
+                None
+                if has_valid_call and not content_present and completion == ""
+                else completion
+            )
             msg: Dict[str, Any] = dict(
                 message=dict(
-                    content=completion,
+                    content=response_content,
                     reasoning_content=reasoning,
                 ),
             )
@@ -1501,6 +1741,7 @@ class OpenAIGPT(LanguageModel):
         else:
             # non-chat mode has no function_call
             msg = dict(text=completion)
+            response_content = completion
             # TODO: Ignoring reasoning content for non-chat models
 
         # create an OpenAIResponse object so we can cache it as if it were
@@ -1509,11 +1750,25 @@ class OpenAIGPT(LanguageModel):
             choices=[msg],
             usage=dict(total_tokens=0),
         )
-        if reasoning == "":
+        # Track whether we extracted inline thought tags from the text.
+        # Only set message_with_reasoning when get_reasoning_final()
+        # actually finds and extracts inline tags (e.g. <think>...</think>).
+        # When reasoning is already provided via a separate API field
+        # (e.g. reasoning_content), the message text doesn't contain
+        # thought signatures, so there's nothing extra to preserve.
+        message_with_reasoning = None
+        message: str | None
+        if reasoning == "" and response_content is not None:
             # some LLM APIs may not return a separate reasoning field,
             # and the reasoning may be included in the message content
             # within delimiters like <think> ... </think>
-            reasoning, completion = self.get_reasoning_final(completion)
+            reasoning, message = self.get_reasoning_final(response_content)
+            if reasoning:
+                # Inline tags were found and extracted; preserve the
+                # original text so it can be restored in message history.
+                message_with_reasoning = response_content
+        else:
+            message = response_content
 
         prompt_tokens = usage.get("prompt_tokens", 0)
         prompt_tokens_details: Any = usage.get("prompt_tokens_details", {})
@@ -1526,8 +1781,9 @@ class OpenAIGPT(LanguageModel):
 
         return (
             LLMResponse(
-                message=completion,
+                message=message,
                 reasoning=reasoning,
+                message_with_reasoning=message_with_reasoning,
                 cached=False,
                 # don't allow empty list [] here
                 oai_tool_calls=tool_calls or None if len(tool_deltas) > 0 else None,
@@ -1625,10 +1881,19 @@ class OpenAIGPT(LanguageModel):
 
         try:
             return self._generate(prompt, max_tokens)
+        except openai.APIStatusError as e:
+            # Catch HTTP-level API errors (400, 401, 403, 404, 422, 429, 5xx)
+            # without traceback — these originate server-side and a local
+            # stack trace adds no diagnostic value.
+            # Note: APIConnectionError/APITimeoutError are intentionally NOT
+            # caught here so they fall through to the generic handler below,
+            # where the full traceback aids in diagnosing local network issues.
+            logging.error(f"API error in OpenAIGPT.generate: {e}")
+            raise
         except Exception as e:
             # log and re-raise exception
             logging.error(friendly_error(e, "Error in OpenAIGPT.generate: "))
-            raise e
+            raise
 
     def _generate(self, prompt: str, max_tokens: int) -> LLMResponse:
         if self.config.use_chat_for_completion:
@@ -1696,9 +1961,9 @@ class OpenAIGPT(LanguageModel):
         if not isinstance(response, dict):
             response = response.model_dump()
         if "message" in response["choices"][0]:
-            msg = response["choices"][0]["message"]["content"].strip()
+            msg = (response["choices"][0]["message"]["content"] or "").strip()
         else:
-            msg = response["choices"][0]["text"].strip()
+            msg = (response["choices"][0]["text"] or "").strip()
         return LLMResponse(message=msg, cached=cached)
 
     async def agenerate(self, prompt: str, max_tokens: int = 200) -> LLMResponse:
@@ -1706,10 +1971,14 @@ class OpenAIGPT(LanguageModel):
 
         try:
             return await self._agenerate(prompt, max_tokens)
+        except openai.APIStatusError as e:
+            # Catch HTTP-level API errors (see comment in generate() above).
+            logging.error(f"API error in OpenAIGPT.agenerate: {e}")
+            raise
         except Exception as e:
             # log and re-raise exception
             logging.error(friendly_error(e, "Error in OpenAIGPT.agenerate: "))
-            raise e
+            raise
 
     async def _agenerate(self, prompt: str, max_tokens: int) -> LLMResponse:
         # note we typically will not have self.config.stream = True
@@ -1774,9 +2043,9 @@ class OpenAIGPT(LanguageModel):
         if not isinstance(response, dict):
             response = response.model_dump()
         if "message" in response["choices"][0]:
-            msg = response["choices"][0]["message"]["content"].strip()
+            msg = (response["choices"][0]["message"]["content"] or "").strip()
         else:
-            msg = response["choices"][0]["text"].strip()
+            msg = (response["choices"][0]["text"] or "").strip()
         return LLMResponse(message=msg, cached=cached)
 
     def chat(
@@ -1818,10 +2087,14 @@ class OpenAIGPT(LanguageModel):
                 function_call,
                 response_format,
             )
+        except openai.APIStatusError as e:
+            # Catch HTTP-level API errors (see comment in generate() above).
+            logging.error(f"API error in OpenAIGPT.chat: {e}")
+            raise
         except Exception as e:
             # log and re-raise exception
             logging.error(friendly_error(e, "Error in OpenAIGPT.chat: "))
-            raise e
+            raise
 
     async def achat(
         self,
@@ -1872,10 +2145,14 @@ class OpenAIGPT(LanguageModel):
                 response_format,
             )
             return result
+        except openai.APIStatusError as e:
+            # Catch HTTP-level API errors (see comment in generate() above).
+            logging.error(f"API error in OpenAIGPT.achat: {e}")
+            raise
         except Exception as e:
             # log and re-raise exception
             logging.error(friendly_error(e, "Error in OpenAIGPT.achat: "))
-            raise e
+            raise
 
     def _chat_completions_with_backoff_body(self, **kwargs):  # type: ignore
         cached = False
@@ -2110,8 +2387,11 @@ class OpenAIGPT(LanguageModel):
                 args[new_param] = args.pop(old_param)
 
         # finally, get rid of extra_body params exclusive to certain models
+        # Only apply allowlist restrictions for known models.
+        # Unknown/custom models are allowed to use all params by default.
+        is_known_model = self.info().name != "unknown"
         extra_params = args.get("extra_body", {})
-        if extra_params:
+        if extra_params and is_known_model:
             for param, model_list in OpenAI_API_ParamInfo().extra_parameters.items():
                 if (
                     self.config.chat_model not in model_list
@@ -2157,19 +2437,33 @@ class OpenAIGPT(LanguageModel):
             }
         }
         """
-        if response.get("choices") is None:
-            message = {}
+        choices = response.get("choices")
+        if isinstance(choices, list) and len(choices) > 0:
+            message = choices[0].get("message", {})
         else:
-            message = response["choices"][0].get("message", {})
+            message = {}
         if message is None:
             message = {}
-        msg = message.get("content", "")
+        content = message.get("content")
         reasoning = message.get("reasoning_content", "")
-        if reasoning == "" and msg is not None:
+        # Track whether we extracted inline thought tags from the text.
+        # Only set message_with_reasoning when get_reasoning_final()
+        # actually finds and extracts inline tags (e.g. <think>...</think>).
+        # When reasoning is already provided via a separate API field
+        # (e.g. reasoning_content), the message text doesn't contain
+        # thought signatures, so there's nothing extra to preserve.
+        message_with_reasoning = None
+        if reasoning == "" and content is not None:
             # some LLM APIs may not return a separate reasoning field,
             # and the reasoning may be included in the message content
             # within delimiters like <think> ... </think>
-            reasoning, msg = self.get_reasoning_final(msg)
+            reasoning, msg = self.get_reasoning_final(content)
+            if reasoning:
+                # Inline tags were found and extracted; preserve the
+                # original text so it can be restored in message history.
+                message_with_reasoning = content
+        else:
+            msg = content
 
         if message.get("function_call") is None:
             fun_call = None
@@ -2200,10 +2494,15 @@ class OpenAIGPT(LanguageModel):
                         f"{json.dumps(tool_call_dict)} "
                         "treating as normal non-tool message"
                     )
-                    msg = msg + "\n" + json.dumps(tool_call_dict)
+                    serialized_tool_call = json.dumps(tool_call_dict)
+                    msg = (msg or "") + ("\n" if msg else "") + serialized_tool_call
         return LLMResponse(
-            message=msg.strip() if msg is not None else "",
+            # None (no content, e.g. a tool-call-only response) is preserved as
+            # None rather than coerced to "", so the distinction survives
+            # downstream (see LLMMessage.content / ChatDocument.content_is_none).
+            message=msg.strip() if msg is not None else None,
             reasoning=reasoning.strip() if reasoning is not None else "",
+            message_with_reasoning=message_with_reasoning,
             function_call=fun_call,
             oai_tool_calls=oai_tool_calls or None,  # don't allow empty list [] here
             cached=cached,

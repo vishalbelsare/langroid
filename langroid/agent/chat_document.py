@@ -6,7 +6,7 @@ from collections import OrderedDict
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from langroid.agent.tool_message import ToolMessage
 from langroid.agent.xml_tool_message import XMLToolMessage
@@ -57,6 +57,20 @@ class ChatDocMetaData(DocMetaData):
     agent_id: str = ""  # ChatAgent that generated this message
     msg_idx: int = -1  # index of this message in the agent `message_history`
     sender: Entity  # sender of the message
+    # True if this msg was relayed from another agent's LLM/handler output in a
+    # multi-agent handoff (a Task then relabels sender -> USER). Lets handle-only
+    # tools be dispatched for legitimate handoffs while still blocking raw
+    # USER-injected tool JSON. See ChatAgent._filter_user_origin_tools and
+    # GHSA-gjgq-w2m6-wr5q.
+    tools_from_agent: bool = False
+    # True if this msg's content/tools derive from external untrusted (USER)
+    # input via a MECHANICAL path: a deepcopy of a tainted msg, or tools
+    # repackaged from a USER msg's content (e.g. DonePassTool/AgentDoneTool).
+    # Unlike `tools_from_agent` (a trust signal), this is a DISTRUST signal that
+    # vetoes handle-only tool dispatch even across a USER relabel, closing the
+    # content-laundering hole. Propagated (deepcopy carries it), never cleared.
+    # See ChatAgent._filter_user_origin_tools and issue #1035 (taint propagation).
+    tainted: bool = False
     # tool_id corresponding to single tool result in ChatDocument.content
     oai_tool_id: str | None = None
     tool_ids: List[str] = []  # stack of tool_ids; used by OpenAIAssistant
@@ -68,6 +82,23 @@ class ChatDocMetaData(DocMetaData):
     displayed: bool = False
     has_citation: bool = False
     status: Optional[StatusCode] = None
+
+    @model_validator(mode="after")
+    def _mark_tools_from_agent(self) -> "ChatDocMetaData":
+        # Mark messages produced directly by an LLM: the tools in an LLM's
+        # output are the LLM's own decision (the trusted trigger for handle-only
+        # tools -- see GHSA-gjgq-w2m6-wr5q), so the mark lets a Task relay them
+        # to another agent even after relabeling the sender to USER. The mark is
+        # only ever SET, never cleared, so it survives relabeling and deepcopies
+        # (e.g. ForwardTool/PassTool deepcopy the LLM-born message, carrying the
+        # mark across the handoff). We deliberately do NOT mark generic AGENT
+        # messages: a pass-through/echoing agent could surface untrusted USER
+        # text (with embedded tool JSON) as AGENT content, and marking that
+        # would re-open the user-origin bypass. Raw USER input is never marked,
+        # so it stays filtered. See ChatAgent._filter_user_origin_tools.
+        if self.sender == Entity.LLM:
+            self.tools_from_agent = True
+        return self
 
     @property
     def parent(self) -> Optional["ChatDocument"]:
@@ -120,6 +151,19 @@ class ChatDocument(Document):
 
     reasoning: str = ""  # reasoning produced by a reasoning LLM
     content_any: Any = None  # to hold arbitrary data returned by responders
+    # True when the underlying LLM response had NO content (only a tool/function
+    # call), as opposed to content == "" (present but empty). `content` itself
+    # stays a mandatory str (""), so this flag is what carries "missing" through
+    # to to_LLMMessage(), which reproduces it as LLMMessage.content = None.
+    # (content_any cannot serve this role — it defaults to None on every doc.)
+    content_is_none: bool = False
+    # Original LLM response text including inline thought signatures
+    # (e.g. <thinking>...</thinking>). Only populated when reasoning was
+    # extracted from inline tags in the message text. Used by to_LLMMessage()
+    # to preserve thought signatures in message history, which is critical
+    # for models like Gemini 3 Flash and Amazon Nova that rely on seeing
+    # their own thought tags in context to maintain reasoning ability.
+    content_with_reasoning: Optional[str] = None
     files: List[FileAttachment] = []  # list of file attachments
     oai_tool_calls: Optional[List[OpenAIToolCall]] = None
     oai_tool_id2result: Optional[OrderedDict[str, str]] = None
@@ -130,7 +174,10 @@ class ChatDocument(Document):
     tool_messages: List[ToolMessage] = []
     # all known tools in the msg that are in an agent's llm_tools_known list,
     # even if non-used/handled
-    all_tool_messages: List[ToolMessage] = []
+    # (the list is populated by Agent.has_tool_message_attempt())
+    all_tool_messages: Optional[List[ToolMessage]] = None
+    # ID of the agent that populated all_tool_messages (for cache validity)
+    all_tool_messages_agent_id: Optional[str] = None
 
     metadata: ChatDocMetaData
     attachment: None | ChatDocAttachment = None
@@ -291,17 +338,26 @@ class ChatDocument(Document):
     def from_LLMResponse(
         response: LLMResponse,
         displayed: bool = False,
+        recognize_recipient_in_content: bool = True,
     ) -> "ChatDocument":
         """
         Convert LLMResponse to ChatDocument.
         Args:
             response (LLMResponse): LLMResponse to convert.
             displayed (bool): Whether this response was displayed to the user.
+            recognize_recipient_in_content (bool): Whether to parse message text
+                for recipient routing (``TO[<recipient>]:`` and JSON
+                ``{"recipient": ...}``). Default True.
         Returns:
             ChatDocument: ChatDocument representation of this LLMResponse.
         """
-        recipient, message = response.get_recipient_and_message()
-        message = message.strip()
+        # Capture "no content" from the source response (None, not "") before
+        # recipient parsing can turn it into "".
+        content_is_none = response.message is None
+        recipient, message = response.get_recipient_and_message(
+            recognize_recipient_in_content
+        )
+        message = message.strip() if message is not None else ""
         if message in ["''", '""']:
             message = ""
         if response.function_call is not None:
@@ -312,7 +368,9 @@ class ChatDocument(Document):
                 ChatDocument._clean_fn_call(oai_tc.function)
         return ChatDocument(
             content=message,
+            content_is_none=content_is_none,
             reasoning=response.reasoning,
+            content_with_reasoning=response.message_with_reasoning,
             content_any=message,
             oai_tool_calls=response.oai_tool_calls,
             function_call=response.function_call,
@@ -341,6 +399,7 @@ class ChatDocument(Document):
                 source=Entity.USER,
                 sender=Entity.USER,
                 recipient=recipient,
+                tainted=True,  # external user input is untrusted (#1035)
             ),
         )
 
@@ -374,6 +433,7 @@ class ChatDocument(Document):
 
         return ChatDocument(
             content=message.content or "",
+            content_is_none=message.content is None,
             content_any=message.content,
             files=message.files,
             function_call=message.function_call,
@@ -385,6 +445,9 @@ class ChatDocument(Document):
                 recipient=recipient,
                 oai_tool_id=message.tool_call_id,
                 tool_ids=[message.tool_id] if message.tool_id else [],
+                # USER-role history is external user input (#1035), symmetric
+                # with from_str / _user_response_final.
+                tainted=sender_entity == Entity.USER,
             ),
         )
 
@@ -410,7 +473,27 @@ class ChatDocument(Document):
         sender_role = Role.USER
         if isinstance(message, str):
             message = ChatDocument.from_str(message)
-        content = message.content or to_string(message.content_any) or ""
+        # Prefer content_with_reasoning when available — this preserves
+        # inline thought signatures (e.g. <thinking>...</thinking>) in
+        # message history, which certain models (Gemini 3 Flash, Amazon
+        # Nova) need to maintain reasoning across turns.
+        # content_with_reasoning is only set when inline tags were
+        # actually extracted, so this won't interfere with models that
+        # provide reasoning via a separate API field.
+        # content_is_none is the authoritative serialized representation of an
+        # absent LLM response body. It must win over stale text fields when a
+        # ChatDocument is persisted and reconstructed.
+        content: Optional[str] = None
+        if not message.content_is_none:
+            content = (
+                message.content_with_reasoning
+                or message.content
+                # content_any may hold parsed structured output (e.g. tool-call
+                # args loaded under a strict output_format), which is NOT message
+                # text — never let it stand in for content on a call-only turn.
+                or to_string(message.content_any)
+                or ""
+            )
         fun_call = message.function_call
         oai_tool_calls = message.oai_tool_calls
         if message.metadata.sender == Entity.USER and fun_call is not None:
@@ -421,14 +504,28 @@ class ChatDocument(Document):
             # But a function-call can only be generated by an entity with
             # Role.ASSISTANT, so we instead put the content of the function-call
             # in the content of the message.
-            content += " " + str(fun_call)
+            content = (content or "") + " " + str(fun_call)
             fun_call = None
         if message.metadata.sender == Entity.USER and oai_tool_calls is not None:
             # same reasoning as for function-call above
-            content += " " + "\n\n".join(str(tc) for tc in oai_tool_calls)
+            content = (
+                (content or "") + " " + "\n\n".join(str(tc) for tc in oai_tool_calls)
+            )
             oai_tool_calls = None
-        # some LLM APIs (e.g. gemini) don't like empty msg
-        content = content or " "
+        # Faithfully carry the response shape: if the underlying LLM response
+        # had NO content (content_is_none), reproduce that as None ("missing"),
+        # distinct from a present-but-empty "". content_is_none is the signal
+        # (content_any can't be — it defaults to None on every ChatDocument,
+        # and may carry parsed structured output rather than text; see above).
+        # `not content` still lets a USER-sender fold a function/tool call into
+        # content above. How a missing content is rendered on the wire is left
+        # to LLMMessage.api_dict (it drops None, and pads a lone space only when
+        # a message would otherwise be completely empty). This is what lets an
+        # assistant tool-call turn omit `content`: Gemini 3.x rejects an
+        # assistant turn that has BOTH a tool/function call and (even
+        # whitespace) text content.
+        if message.content_is_none and not content:
+            content = None
         sender_name = message.metadata.sender_name
         tool_ids = message.metadata.tool_ids
         tool_id = tool_ids[-1] if len(tool_ids) > 0 else ""

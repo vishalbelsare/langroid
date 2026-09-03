@@ -1,13 +1,13 @@
 [project]
 name = "langroid"
-version = "0.59.13"
+version = "0.67.7"
 authors = [
     {name = "Prasad Chalasani", email = "pchalasani@gmail.com"},
 ]
 description = "Harness LLMs with Multi-Agent Programming"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = "<3.13,>=3.10"
+requires-python = "<3.14,>=3.10"
 dependencies = [
     "adb-cloud-connector<2.0.0,>=1.0.2",
     "aiohttp<4.0.0,>=3.9.1",
@@ -29,21 +29,29 @@ dependencies = [
     "grpcio<2.0.0,>=1.62.1",
     "halo<1.0.0,>=0.0.31",
     "jinja2<4.0.0,>=3.1.2",
-    "json-repair<1.0.0,>=0.29.9",
-    "lxml<6.0.0,>=5.4.0",
+    # Capped below 0.61.3: that release changed how unquoted values are
+    # repaired, and an unquoted value followed by another key and a nested
+    # object silently swallows the next key/value pair, e.g.
+    #   {request: foo, args: bar baz, opts: {"a": b}}
+    # yields {'request': 'foo,\n args: bar baz', 'opts': {...}} -- the `args`
+    # field is LOST. langroid parses exactly this shape out of sloppy LLM tool
+    # calls, so the field loss is silent and material. 0.61.0-0.61.2 are fine;
+    # see tests/main/test_json.py::test_repair_keeps_unquoted_value_fields.
+    "json-repair>=0.29.9,<0.61.3",
+    "lxml<7.0.0,>=6.1.0",
     "markdownify>=0.13.1",
     "nest-asyncio<2.0.0,>=1.6.0",
     "nltk<4.0.0,>=3.8.2",
     "onnxruntime<2.0.0,>=1.16.1",
-    "openai<2.0.0,>=1.61.1",
+    "openai>=1.106.0,<3.0.0",
     "pandas<3.0.0,>=2.0.3",
     "prettytable<4.0.0,>=3.8.0",
     "pydantic<3.0.0,>=2.0.0",
     "pydantic-settings<3.0.0,>=2.0.0",
     "pygithub<2.0.0,>=1.58.1",
     "pygments<3.0.0,>=2.15.1",
-    "pymupdf4llm<0.1.0,>=0.0.17",
     "pyparsing<4.0.0,>=3.0.9",
+    "pypdfium2<5.0.0,>=4.30.0",
     "pytest-rerunfailures<16.0,>=15.0",
     "python-dotenv>=1.0.0,<2.0.0",
     "python-magic<1.0.0,>=0.4.27",
@@ -78,16 +86,17 @@ hf-transformers = [
     "sentence-transformers<3.0.0,>=2.2.2",
     "torch<3.0.0,>=2.0.0",
     "transformers<5.0.0,>=4.40.1",
-    "huggingface-hub<1.0.0,>=0.21.2",    
+    "huggingface-hub<1.0.0,>=0.21.2",
 ]
 
 vecdbs = [
-    "lancedb<0.9.0,>=0.8.2",
+    "lancedb>=0.9.0",
     "tantivy<0.22.0,>=0.21.0",
-    "pyarrow<16.0.0,>=15.0.0",
+    "pyarrow>=15.0.0",
     "chromadb<=0.4.23,>=0.4.21",
     "weaviate-client>=4.9.6",
     "pinecone-client>=5.0.1",
+    "pymilvus[milvus-lite]>=3.0.0",
 ]
 
 db = [
@@ -95,13 +104,14 @@ db = [
     "psycopg2<3.0.0,>=2.9.7",
     "psycopg2-binary>=2.9.10",
     "pymysql<2.0.0,>=1.1.0",
+    "sqlglot>=23.0.0",
 ]
 
 all = [
     "pdf2image<2.0.0,>=1.17.0",
     "pymupdf<2.0.0,>=1.23.3",
     "pymupdf4llm<0.1.0,>=0.0.17",
-    "docling<3.0.0,>=2.16.0",
+    "docling<3.0.0,>=2.20.0",
     "pypdf>=5.1.0",
     "pytesseract<0.4.0,>=0.3.10",
     "python-docx<2.0.0,>=1.1.0",
@@ -109,6 +119,7 @@ all = [
     "sqlalchemy<3.0.0,>=2.0.19",
     "psycopg2<3.0.0,>=2.9.7",
     "pymysql<2.0.0,>=1.1.0",
+    "sqlglot>=23.0.0",
     "sentence-transformers<3.0.0,>=2.2.2",
     "torch<3.0.0,>=2.0.0",
     "transformers<5.0.0,>=4.40.1",
@@ -126,13 +137,15 @@ all = [
     "pgvector>=0.3.6",
     "psycopg2-binary>=2.9.10",
     "marker-pdf",
+    "seltz>=0.2.0",
+    "pymilvus[milvus-lite]>=3.0.0",
 ]
 
 # More granular groupings
 lancedb = [
-    "lancedb<0.9.0,>=0.8.2",
+    "lancedb>=0.9.0",
     "tantivy<0.22.0,>=0.21.0",
-    "pyarrow<16.0.0,>=15.0.0",
+    "pyarrow>=15.0.0",
 ]
 
 docling = [
@@ -141,6 +154,10 @@ docling = [
 
 pymupdf4llm = [
     "pymupdf4llm<0.1.0,>=0.0.17",
+]
+
+pypdfium2 = [
+    "pypdfium2<5.0.0,>=4.30.0",
 ]
 
 pdf-parsers = [
@@ -191,16 +208,19 @@ postgres = [
     "psycopg2<3.0.0,>=2.9.7",
     "psycopg2-binary>=2.9.10",
     "sqlalchemy<3.0.0,>=2.0.19",
+    "sqlglot>=23.0.0",
 ]
 
 mysql = [
     "pymysql<2.0.0,>=1.1.0",
+    "sqlglot>=23.0.0",
 ]
 
 sql = [
     "sqlalchemy<3.0.0,>=2.0.19",
     "pymysql<2.0.0,>=1.1.0",
     "psycopg2<3.0.0,>=2.9.7",
+    "sqlglot>=23.0.0",
 ]
 
 litellm = [
@@ -228,8 +248,12 @@ tavily = [
     "tavily-python>=0.5.0",
 ]
 
+seltz = [
+    "seltz>=0.2.0",
+]
+
 chainlit = [
-    "chainlit<3.0.0,>=2.0.1",    
+    "chainlit<3.0.0,>=2.0.1",
     "python-socketio<6.0.0,>=5.11.0",
 ]
 
@@ -274,6 +298,9 @@ firecrawl = [
 crawl4ai = [
     "crawl4ai>=0.6.3",
 ]
+milvus = [
+    "pymilvus[milvus-lite]>=3.0.0",
+]
 
 
 [dependency-groups]
@@ -311,7 +338,27 @@ docs = [
     "mkdocs-literate-nav<1.0.0,>=0.6.0",
     "mkdocs-section-index<1.0.0,>=0.3.5",
     "mkdocs-jupyter<1.0.0,>=0.24.1",
-    "griffe<1.0.0",
+    "nbconvert>=7.17.0",
+]
+
+
+# Lock-only constraints (NOT part of published metadata / downstream installs).
+# The bulk `uv lock --upgrade` (to drain Dependabot alerts) moved these deps
+# -- none of which has a security alert -- to versions that break us:
+#   - qdrant-client>=1.16 removes Client.search_batch + CollectionInfo.vectors_count
+#     used by QdrantDB (runtime break). Public range stays broad pending a code migration.
+#   - onnxruntime>=1.24 ships no cp310 wheels/sdist, breaking `uv sync` on Python 3.10
+#     (we advertise >=3.10). pip installs are unaffected (they pick the newest cp310 wheel).
+#   - mypy>=1.16 (dev-only) adds stricter checks that flag safe Responder-union access.
+#   - pinecone-client>=6 is an import-time stub that raises ("renamed to `pinecone`"),
+#     breaking VectorStore.create() for every backend. Hold at the working 5.x line.
+# Pinning here (not in [project]/[dependency-groups]) keeps public ranges untouched.
+[tool.uv]
+constraint-dependencies = [
+    "qdrant-client<1.16",
+    "onnxruntime<1.24",
+    "mypy<1.16",
+    "pinecone-client<6",
 ]
 
 

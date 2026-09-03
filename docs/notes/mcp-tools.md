@@ -216,6 +216,87 @@ the pattern of usage with Langroid will remain the same.
 
 ---
 
+## Best Practice: Use a server factory for stdio transports
+
+Starting with fastmcp 2.13 and mcp 1.21, stdio transports (e.g., `StdioTransport`,
+`NpxStdioTransport`, `UvxStdioTransport`) are effectively single‑use. Reusing the
+same transport instance across multiple connections can lead to errors such as
+`anyio.ClosedResourceError` during session initialization.
+
+To make your code robust and future‑proof, pass a zero‑argument server factory to
+Langroid’s MCP helpers. A “server factory” is simply a `lambda` or function that
+returns a fresh server spec or transport each time.
+
+Benefits:
+
+- Fresh, reliable connections on every call (no reuse of closed transports).
+- Works across fastmcp/mcp versions without subtle lifecycle issues.
+- Enables concurrent calls safely (each call uses its own subprocess/session).
+- Keeps your decorator ergonomics and `handle_async` overrides unchanged.
+
+You can use a factory with both the decorator and the async helpers:
+
+```python
+from fastmcp.client.transports import StdioTransport
+from langroid.agent.tools.mcp import mcp_tool, get_tool_async
+
+# 1) Decorator style
+@mcp_tool(lambda: StdioTransport(command="claude", args=["mcp", "serve"], env={}),
+          "Grep")
+class GrepTool(lr.ToolMessage):
+    async def handle_async(self) -> str:
+        # pre/post-process around the raw MCP call
+        result = await self.call_tool_async()
+        return f"<GrepResult>\n{result}\n</GrepResult>"
+
+# 2) Programmatic style
+BaseGrep = await get_tool_async(
+    lambda: StdioTransport(command="claude", args=["mcp", "serve"], env={}),
+    "Grep",
+)
+```
+
+Notes:
+
+- Passing a concrete transport instance still works: Langroid will try to clone
+  it internally; however, a factory is the most reliable across environments.
+- For network transports (e.g., `SSETransport`), a factory is optional; you can
+  continue passing the transport instance directly.
+
+---
+
+## Output-schema validation: return structured content when required
+
+Newer `mcp` clients validate tool outputs against the tool’s output schema. If a
+tool declares a structured output, returning plain text may raise a runtime
+error. Some servers (for example, Claude Code’s Grep) expose an argument like
+`output_mode` that controls the shape of the response.
+
+Recommendations:
+
+- Prefer structured modes when a tool declares an output schema.
+- If available, set options like `output_mode="structured"` (or a documented
+  structured variant such as `"files_with_matches"`) in your tool’s
+  `handle_async` before calling `await self.call_tool_async()`.
+
+Example tweak in a decorator-based tool:
+
+```python
+@mcp_tool(lambda: StdioTransport(command="claude", args=["mcp", "serve"]),
+          "Grep")
+class GrepTool(lr.ToolMessage):
+    async def handle_async(self) -> str:
+        # Ensure a structured response if the server supports it
+        if hasattr(self, "output_mode"):
+            self.output_mode = "structured"
+        return await self.call_tool_async()
+```
+
+If the server does not provide such a switch, follow its documentation for
+returning data that matches its declared output schema.
+
+---
+
 ## 2. Create Langroid Tools declaratively using the `@mcp_tool` decorator
 
 The above examples showed how you can create Langroid tools programmatically using
@@ -324,8 +405,7 @@ function as shown above, i.e.:
 ```python
 from langroid.agent.tools.mcp import get_tool_async
 
-ExaSearchTool = awwait
-get_tool_async(transport, "web_search_exa")
+ExaSearchTool = await get_tool_async(transport, "web_search_exa")
 ```
 
 We can now define our main function where we create our `ChatAgent`,
@@ -353,5 +433,90 @@ async def main():
     await task.run_async()
 ```
 
-See [`exa-web-search.py`](https://github.com/langroid/langroid/blob/main/examples/mcp/exa-web-search.py) for a full 
-working example of this. 
+See [`exa-web-search.py`](https://github.com/langroid/langroid/blob/main/examples/mcp/exa-web-search.py) for a full working example of this. 
+
+---
+
+## Efficient bulk tool creation
+
+`FastMCPClient.get_tools_async()` builds all Langroid tool classes with a single
+`list_tools()` round-trip. Previously it used `1 + N` calls: one list plus one
+re-list per tool, which slowed tool-init on slow or remote MCP servers exposing
+many tools.
+
+The public, synchronous, network-free helper
+`FastMCPClient.tool_model_from_mcp_tool(target)` converts an already-fetched
+`mcp.types.Tool` into a Langroid `ToolMessage` subclass with no round-trip. Use
+it to build an allow-listed subset from a single `list_tools()` snapshot without
+re-listing the server per tool.
+
+```python
+from langroid.agent.tools.mcp.fastmcp_client import FastMCPClient
+
+
+async with FastMCPClient(server) as client:
+    tools = await client.client.list_tools()
+    wanted = [t for t in tools if t.name in {"search", "fetch"}]
+    models = [client.tool_model_from_mcp_tool(t) for t in wanted]
+```
+
+## Namespacing tools from multiple servers
+
+Two MCP servers can expose the same tool name. Pass `tool_name_prefix` when
+loading each server to give the Langroid-facing names distinct namespaces:
+
+```python
+weather_tools = await get_tools_async(
+    weather_server,
+    tool_name_prefix="weather",
+)
+inventory_tools = await get_tools_async(
+    inventory_server,
+    tool_name_prefix="inventory",
+)
+
+agent.enable_message(weather_tools + inventory_tools)
+```
+
+The prefix must fully match the ASCII pattern `[a-zA-Z0-9_]+`; an empty string
+is invalid. Langroid joins the prefix and original MCP tool name with two
+underscores. If both servers expose `lookup`, the agent therefore sees
+`weather__lookup` and `inventory__lookup`.
+
+The namespace changes only the Langroid-facing request name. Protocol calls use
+the original server tool name for fresh clients and persistent connections.
+Passing `tool_name_prefix=None`, or omitting the argument, applies no prefix and
+preserves the existing behavior.
+
+`ChatAgent.enable_message` identifies collisions by the underlying tool origin.
+It raises `ValueError` if a tool from a different origin is already registered
+with the same final request name. Re-enabling the same class remains valid, as
+does registering a regenerated recipient wrapper for the same underlying tool.
+
+## Tool parameter type mapping
+
+When an MCP tool is converted into a Langroid `ToolMessage`,
+`FastMCPClient._schema_to_field` maps each parameter's JSON Schema to a precise
+Python type. The generated tool therefore validates arguments and shows the LLM
+accurate parameter types.
+
+The mappings are:
+
+- Scalar `enum` and `const` values become `typing.Literal`.
+- `anyOf` and `oneOf` become `typing.Union`. A `{"type": "null"}` branch, or an
+  optional parameter, makes the type `Optional`. Because typing has no
+  exclusive-or, `oneOf` also maps to `Union`.
+- A single-schema `allOf` resolves to that subschema. A multi-schema `allOf`
+  intersection has no typing analogue and falls back to `Any`.
+- A `$ref` into the schema's `$defs` becomes a nested pydantic model. FastMCP
+  emits these references for pydantic-model parameters, including within unions
+  and array items. Reference cycles degrade the cyclic edge to `Any`.
+- An `object` with `properties` becomes a nested model, while an `array` becomes
+  `List[...]`.
+- Anything unrecognized or malformed falls back to `Any`, so a bad schema never
+  breaks tool construction.
+
+Because these constraints are preserved, out-of-set `enum` values and
+wrong-type union values now raise a `ValidationError` instead of being silently
+accepted. Pydantic also re-emits `enum`, `anyOf`, and nullability in the schema
+sent to the LLM, improving grounding.

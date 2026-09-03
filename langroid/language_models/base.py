@@ -1,7 +1,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import (
     Any,
@@ -54,6 +54,7 @@ class StreamEventType(Enum):
     FUNC_ARGS = 3
     TOOL_NAME = 4
     TOOL_ARGS = 5
+    REASONING = 6
 
 
 class RetryParams(BaseSettings):
@@ -97,9 +98,14 @@ class LLMConfig(BaseSettings):
 
     @property
     def model_max_output_tokens(self) -> int:
-        return (
-            self.max_output_tokens or get_model_info(self.chat_model).max_output_tokens
-        )
+        if self.max_output_tokens:
+            return self.max_output_tokens
+        # Build fallback names by progressively stripping provider prefixes
+        # (e.g. "minimax/MiniMax-M2.7" → ["MiniMax-M2.7"]) so that the lookup
+        # succeeds even before OpenAIGPT.__init__ strips the prefix.
+        parts = self.chat_model.split("/")
+        fallbacks = ["/".join(parts[i:]) for i in range(1, len(parts))]
+        return get_model_info(self.chat_model, fallbacks).max_output_tokens
 
 
 class LLMFunctionCall(BaseModel):
@@ -172,6 +178,7 @@ class OpenAIToolCall(BaseModel):
     id: str | None = None
     type: ToolTypes = "function"
     function: LLMFunctionCall | None = None
+    extra_content: Dict[str, Any] | None = None
 
     @staticmethod
     def from_dict(message: Dict[str, Any]) -> "OpenAIToolCall":
@@ -183,7 +190,10 @@ class OpenAIToolCall(BaseModel):
         id = message["id"]
         type = message["type"]
         function = LLMFunctionCall.from_dict(message["function"])
-        return OpenAIToolCall(id=id, type=type, function=function)
+        extra_content = message.get("extra_content")
+        return OpenAIToolCall(
+            id=id, type=type, function=function, extra_content=extra_content
+        )
 
     def __str__(self) -> str:
         if self.function is None:
@@ -273,11 +283,14 @@ class LLMMessage(BaseModel):
     name: Optional[str] = None
     tool_call_id: Optional[str] = None  # which OpenAI LLM tool this is a response to
     tool_id: str = ""  # used by OpenAIAssistant
-    content: str
+    # None means "no content" (the model returned only a tool/function call).
+    # This is distinct from "" and is dropped from the API payload by api_dict;
+    # see api_dict for how a fully-empty message is handled per-API.
+    content: Optional[str] = None
     files: List[FileAttachment] = []
     function_call: Optional[LLMFunctionCall] = None
     tool_calls: Optional[List[OpenAIToolCall]] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # link to corresponding chat document, for provenance/rewind purposes
     chat_document_id: str = ""
 
@@ -302,7 +315,7 @@ class LLMMessage(BaseModel):
             d["content"] = [
                 dict(
                     type="text",
-                    text=self.content,
+                    text=self.content or "",
                 )
             ] + [f.to_dict(model) for f in self.files]
 
@@ -310,9 +323,10 @@ class LLMMessage(BaseModel):
         # in case has_system_role is False
         if not has_system_role and "role" in d and d["role"] == "system":
             d["role"] = "user"
-            if "content" in d:
+            if d.get("content"):
                 d["content"] = "[ADDITIONAL SYSTEM MESSAGE:]\n\n" + d["content"]
-        # drop None values since API doesn't accept them
+        # drop None values since API doesn't accept them (this omits `content`
+        # entirely when it is None, i.e. "no content")
         dict_no_none = {k: v for k, v in d.items() if v is not None}
         if "name" in dict_no_none and dict_no_none["name"] == "":
             # OpenAI API does not like empty name
@@ -323,14 +337,35 @@ class LLMMessage(BaseModel):
                 dict_no_none["function_call"]["arguments"] = json.dumps(
                     dict_no_none["function_call"]["arguments"]
                 )
-        if "tool_calls" in dict_no_none:
+        if dict_no_none.get("tool_calls"):
             # convert tool calls to API format
             for tc in dict_no_none["tool_calls"]:
                 if "arguments" in tc["function"]:
                     # arguments must be a string
-                    tc["function"]["arguments"] = json.dumps(
-                        tc["function"]["arguments"]
-                    )
+                    if tc["function"]["arguments"] is None:
+                        tc["function"]["arguments"] = "{}"
+                    else:
+                        tc["function"]["arguments"] = json.dumps(
+                            tc["function"]["arguments"]
+                        )
+                if "extra_content" in tc and tc["extra_content"] is None:
+                    del tc["extra_content"]
+        else:
+            # An empty tool-call list is not a call and conveys no useful API
+            # information. Omitting it also lets the empty-message fallback
+            # below produce a valid message.
+            dict_no_none.pop("tool_calls", None)
+        # A message with empty content (None was dropped above, or "") AND no
+        # tool/function call would be an entirely empty message, which some APIs
+        # (e.g. Gemini) reject; fall back to a single space in that case only.
+        # When there IS a tool/function call, empty content is fine (and Gemini
+        # 3.x in fact REQUIRES it — it rejects an assistant turn that carries
+        # both a call and non-empty text content).
+        has_call = bool(dict_no_none.get("tool_calls")) or (
+            dict_no_none.get("function_call") is not None
+        )
+        if not has_call and not dict_no_none.get("content"):
+            dict_no_none["content"] = " "
         # IMPORTANT! drop fields that are not expected in API call
         dict_no_none.pop("tool_id", None)
         dict_no_none.pop("timestamp", None)
@@ -341,7 +376,7 @@ class LLMMessage(BaseModel):
         if self.function_call is not None:
             content = "FUNC: " + json.dumps(self.function_call)
         else:
-            content = self.content
+            content = self.content or ""
         name_str = f" ({self.name})" if self.name else ""
         return f"{self.role} {name_str}: {content}"
 
@@ -351,8 +386,18 @@ class LLMResponse(BaseModel):
     Class representing response from LLM.
     """
 
-    message: str
+    # None means the model returned NO content (e.g. only a tool/function
+    # call), which is distinct from an empty string "". Preserving this
+    # distinction lets the message be faithfully reproduced downstream
+    # (see ChatDocument.content_is_none and LLMMessage.content).
+    message: Optional[str] = None
     reasoning: str = ""  # optional reasoning text from reasoning models
+    # Original message text including inline thought signatures (e.g.
+    # <thinking>...</thinking>). Only set when reasoning was extracted
+    # from the message text via get_reasoning_final(); NOT set when
+    # reasoning comes from a separate API field (e.g. reasoning_content),
+    # since in that case the message text never contained thought tags.
+    message_with_reasoning: Optional[str] = None
     # TODO tool_id needs to generalize to multi-tool calls
     tool_id: str = ""  # used by OpenAIAssistant
     oai_tool_calls: Optional[List[OpenAIToolCall]] = None
@@ -366,7 +411,15 @@ class LLMResponse(BaseModel):
         elif self.oai_tool_calls:
             return "\n".join(str(tc) for tc in self.oai_tool_calls)
         else:
-            return self.message
+            return self.message or ""
+
+    def tools_content(self) -> str:
+        if self.function_call is not None:
+            return str(self.function_call)
+        elif self.oai_tool_calls:
+            return "\n".join(str(tc) for tc in self.oai_tool_calls)
+        else:
+            return ""
 
     def to_LLMMessage(self) -> LLMMessage:
         """Convert LLM response to an LLMMessage, to be included in the
@@ -389,6 +442,7 @@ class LLMResponse(BaseModel):
 
     def get_recipient_and_message(
         self,
+        recognize_recipient_in_content: bool = True,
     ) -> Tuple[str, str]:
         """
         If `message` or `function_call` of an LLM response contains an explicit
@@ -396,9 +450,14 @@ class LLMResponse(BaseModel):
         of the recipient name if specified.
 
         Two cases:
-        (a) `message` contains addressing string "TO: <name> <content>", or
+        (a) `message` contains addressing string ``TO[<name>]:<content>``, or
         (b) `message` is empty and function_call/tool_call with explicit `recipient`
 
+        Args:
+            recognize_recipient_in_content (bool): When True (default), parses
+                message text for ``TO[<recipient>]:<content>`` patterns and
+                top-level JSON ``{"recipient": "..."}`` fields. When False,
+                only function_call/tool_call ``recipient`` fields are checked.
 
         Returns:
             (str): name of recipient, which may be empty string if no recipient
@@ -415,7 +474,7 @@ class LLMResponse(BaseModel):
                 recipient = args.get("recipient", "")
             return recipient, msg
         else:
-            msg = self.message
+            msg = self.message or ""
             if self.oai_tool_calls is not None:
                 # get the first tool that has a recipient field, if any
                 for tc in self.oai_tool_calls:
@@ -425,6 +484,9 @@ class LLMResponse(BaseModel):
                         )  # type: ignore
                         if recipient is not None and recipient != "":
                             return recipient, ""
+
+        if not recognize_recipient_in_content:
+            return "", msg
 
         # It's not a function or tool call, so continue looking to see
         # if a recipient is specified in the message.
@@ -529,7 +591,7 @@ class LanguageModel(ABC):
         if len(messages) == 0 or messages[0].role != Role.SYSTEM:
             logger.warning("No system msg, creating dummy system prompt")
             messages.insert(0, LLMMessage(content=DUMMY_SYS_PROMPT, role=Role.SYSTEM))
-        system_prompt = messages[0].content
+        system_prompt = messages[0].content or ""
 
         # now we have messages = [Sys,...]
         if len(messages) == 1:
@@ -553,8 +615,8 @@ class LanguageModel(ABC):
 
         # now we have messages = [Sys, user, ..., user]
         # so we omit the first and last elements and make pairs of user-asst messages
-        conversation = [m.content for m in messages[1:-1]]
-        user_prompt = messages[-1].content
+        conversation = [m.content or "" for m in messages[1:-1]]
+        user_prompt = messages[-1].content or ""
         pairs = LanguageModel.user_assistant_pairs(conversation)
         return system_prompt, pairs, user_prompt
 
@@ -784,13 +846,17 @@ class LanguageModel(ABC):
         """.strip()
 
         show_if_debug(prompt, "FOLLOWUP->STANDALONE-PROMPT= ")
-        standalone = self.chat(
-            messages=[
-                LLMMessage(role=Role.SYSTEM, content=prompt),
-                LLMMessage(role=Role.USER, content=follow_up_question),
-            ],
-            max_tokens=1024,
-        ).message.strip()
+        standalone = (
+            self.chat(
+                messages=[
+                    LLMMessage(role=Role.SYSTEM, content=prompt),
+                    LLMMessage(role=Role.USER, content=follow_up_question),
+                ],
+                max_tokens=1024,
+            ).message
+            or ""
+        )
+        standalone = standalone.strip()
 
         show_if_debug(prompt, "FOLLOWUP->STANDALONE-RESPONSE= ")
         return standalone

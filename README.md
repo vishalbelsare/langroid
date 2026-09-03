@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/langroid-card-lambda-ossem-rust-1200-630.png" alt="Logo" 
+  <img src="https://raw.githubusercontent.com/langroid/langroid/main/docs/assets/langroid-card-lambda-ossem-rust-1200-630.png" alt="Logo"
         width="400" align="center">
 </div>
 
@@ -16,7 +16,6 @@
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=flat&logo=discord&logoColor=white)](https://discord.gg/ZU36McDgDs)
 [![Substack](https://img.shields.io/badge/Substack-%23006f5c.svg?style=flat&logo=substack&logoColor=FF6719)](https://langroid.substack.com/p/langroid-harness-llms-with-multi-agent-programming)
 
-[![GitMCP](https://img.shields.io/endpoint?url=https://gitmcp.io/badge/OWNER/REPO)](https://gitmcp.io/langroid/langroid)
 </div>
 
 <h3 align="center">
@@ -30,7 +29,7 @@
   <a target="_blank" href="https://discord.gg/ZU36McDgDs" rel="dofollow">
       <strong>Discord</strong></a>
   &middot;
-  <a target="_blank" href="./CONTRIBUTING.md" rel="dofollow">
+  <a target="_blank" href="https://github.com/langroid/langroid/blob/main/CONTRIBUTING.md" rel="dofollow">
       <strong>Contributing</strong></a>
 
   <br />
@@ -50,10 +49,14 @@ into simplifying the developer experience;
 it does not use `Langchain`, or any other LLM framework, 
 and works with [practically any LLM](https://langroid.github.io/langroid/tutorials/supported-models/).
 
-:fire: Read the (WIP) [overview of the langroid architecture](https://langroid.github.io/langroid/blog/2024/08/15/overview-of-langroids-multi-agent-architecture-prelim/), 
+🔥 ✨ A Claude Code [plugin](#claude-code-plugin-optional) is available to
+accelerate Langroid development with built-in patterns and best practices.
+
+
+🔥 Read the (WIP) [overview of the langroid architecture](https://langroid.github.io/langroid/blog/2024/08/15/overview-of-langroids-multi-agent-architecture-prelim/), 
  and a [quick tour of Langroid](https://langroid.github.io/langroid/tutorials/langroid-tour/).
 
-:fire: MCP Support: Allow any LLM-Agent to leverage MCP Servers via Langroid's simple
+🔥 MCP Support: Allow any LLM-Agent to leverage MCP Servers via Langroid's simple
 [MCP tool adapter](https://langroid.github.io/langroid/notes/mcp-tools/) that converts 
 the server's tools into Langroid's `ToolMessage` instances.
 
@@ -63,14 +66,14 @@ the server's tools into Langroid's `ToolMessage` instances.
 > It finds, prioritizes and fixes vulnerabilities. We have internally adapted Langroid's multi-agent orchestration framework in production, after evaluating CrewAI, Autogen, LangChain, Langflow, etc. We found Langroid to be far superior to those frameworks in terms of ease of setup and flexibility. Langroid's Agent and Task abstractions are intuitive, well thought out, and provide a great developer  experience. We wanted the quickest way to get something in production. With other frameworks it would have taken us weeks, but with Langroid we got to good results in minutes. Highly recommended! <br> -- Jacky Wong, Head of AI at Nullify.
 
 
-:fire: See this [Intro to Langroid](https://lancedb.substack.com/p/langoid-multi-agent-programming-framework)
+🔥 See this [Intro to Langroid](https://lancedb.substack.com/p/langoid-multi-agent-programming-framework)
 blog post from the LanceDB team
 
-:fire: Just published in ML for Healthcare (2024): a Langroid-based Multi-Agent RAG system for 
+🔥 Just published in ML for Healthcare (2024): a Langroid-based Multi-Agent RAG system for 
 pharmacovigilance, see [blog post](https://langroid.github.io/langroid/blog/2024/08/12/malade-multi-agent-architecture-for-pharmacovigilance/)
 
 
-We welcome contributions: See the [contributions](./CONTRIBUTING.md) document
+We welcome contributions: See the [contributions](https://github.com/langroid/langroid/blob/main/CONTRIBUTING.md) document
 for ideas on what to contribute.
 
 Are you building LLM Applications, or want help with Langroid for your company, 
@@ -90,7 +93,7 @@ See the Langroid Quick-Start [Colab](https://colab.research.google.com/github/la
 that builds up to a 2-agent information-extraction example using the OpenAI ChatCompletion API. 
 See also this [version](https://colab.research.google.com/drive/190Tk7t4AdY1P9F_NlZ33-YEoGnHweQQ0) that uses the OpenAI Assistants API instead.
 
-:fire: just released! [Example](https://github.com/langroid/langroid-examples/blob/main/examples/docqa/chat-multi-extract-local.py) 
+🔥 just released! [Example](https://github.com/langroid/langroid-examples/blob/main/examples/docqa/chat-multi-extract-local.py) 
 script showing how you can use Langroid multi-agents and tools
 to extract structured information from a document using **only a local LLM**
 (Mistral-7b-instruct-v0.2).
@@ -138,11 +141,28 @@ teacher_task.add_sub_task(student_task)
 teacher_task.run()
 ```
 
-# :fire: Updates/Releases
+# 🔥 Updates/Releases
 
 <details>
 <summary> <b>Click to expand</b></summary>
 
+- **Aug 2026:**
+  - [0.67.0](https://github.com/langroid/langroid/releases/tag/0.67.0) Security hardening: 
+    per-provider `env_prefix` for vector-store configs (env-var naming change -- see 
+    [migration notes](https://langroid.github.io/langroid/notes/vecstore-env-prefix/)), 
+    generalized taint propagation across tool re-emission paths, and a one-time warning 
+    when `FileAttachment` payloads inflate context preflight.
+  - [0.66.0](https://github.com/langroid/langroid/releases/tag/0.66.0) Big community batch (14 PRs):
+    [Milvus vector store](https://langroid.github.io/langroid/notes/milvus/) (thanks @zc277584121); 
+    [Markdown/HTML document parsing](https://langroid.github.io/langroid/notes/markdown-html-parsing/) 
+    (thanks @nuthalapativarun); cooperative `max_time` 
+    [task budgets](https://langroid.github.io/langroid/notes/task-termination/), MCP tool 
+    namespacing for multi-server agents, and portable JSON chat-history snapshots 
+    (thanks @Whxuan0701); video attachments (thanks @octo-patch); retrieval score 
+    thresholds (thanks @Koushik-Salammagari); even 
+    [context-overflow truncation](https://langroid.github.io/langroid/notes/context-overflow/) 
+    and several routing/parsing fixes -- full details in the 
+    [release notes](https://github.com/langroid/langroid/releases/tag/0.66.0).
 - **Aug 2025:**
   - [0.59.0](https://github.com/langroid/langroid/releases/tag/0.59.0) Complete Pydantic V2 Migration - 
     5-50x faster validation, modern Python patterns, 100% backward compatible.
@@ -356,7 +376,7 @@ default handler method name in `request` field (thanks @alexagr).
     [`test_openai_assistant.py`](https://github.com/langroid/langroid/blob/main/tests/main/test_openai_assistant.py),
     [`test_openai_assistant_async.py`](https://github.com/langroid/langroid/blob/main/tests/main/test_openai_assistant_async.py)
   - **0.1.111:** Support latest OpenAI model: `GPT4_TURBO`
-(see [test_llm.py](tests/main/test_llm.py) for example usage)
+(see [test_llm.py](https://github.com/langroid/langroid/blob/main/tests/main/test_llm.py) for example usage)
   - **0.1.110:** Upgrade from OpenAI v0.x to v1.1.1 (in preparation for 
     Assistants API and more); (`litellm` temporarily disabled due to OpenAI 
     version conflict).
@@ -387,30 +407,30 @@ default handler method name in `request` field (thanks @alexagr).
   - **0.1.55:** Improved [`SQLChatAgent`](https://github.com/langroid/langroid/blob/main/langroid/agent/special/sql/sql_chat_agent.py) that efficiently retrieves relevant schema info when translating natural language to SQL.  
 - **Aug 2023:**
   - **[Hierarchical computation](https://langroid.github.io/langroid/examples/agent-tree/)** example using Langroid agents and task orchestration.
-  - **0.1.51:** Support for global state, see [test_global_state.py](tests/main/test_global_state.py).
-  - **:whale: Langroid Docker image**, available, see instructions below.
-  - [**RecipientTool**](langroid/agent/tools/recipient_tool.py) enables (+ enforces) LLM to 
+  - **0.1.51:** Support for global state, see [test_global_state.py](https://github.com/langroid/langroid/blob/main/tests/main/test_global_state.py).
+  - **🐳 Langroid Docker image**, available, see instructions below.
+  - [**RecipientTool**](https://github.com/langroid/langroid/blob/main/langroid/agent/tools/recipient_tool.py) enables (+ enforces) LLM to 
 specify an intended recipient when talking to 2 or more agents. 
-See [this test](tests/main/test_recipient_tool.py) for example usage.
-  - **Example:** [Answer questions](examples/docqa/chat-search.py) using Google Search + vecdb-retrieval from URL contents. 
-  - **0.1.39:** [`GoogleSearchTool`](langroid/agent/tools/google_search_tool.py) to enable Agents (their LLM) to do Google searches via function-calling/tools.
-    See [this chat example](examples/basic/chat-search.py) for how easy it is to add this tool to an agent.
+See [this test](https://github.com/langroid/langroid/blob/main/tests/main/test_recipient_tool.py) for example usage.
+  - **Example:** [Answer questions](https://github.com/langroid/langroid/blob/main/examples/docqa/chat-search.py) using Google Search + vecdb-retrieval from URL contents. 
+  - **0.1.39:** [`GoogleSearchTool`](https://github.com/langroid/langroid/blob/main/langroid/agent/tools/google_search_tool.py) to enable Agents (their LLM) to do Google searches via function-calling/tools.
+    See [this chat example](https://github.com/langroid/langroid/blob/main/examples/basic/chat-search.py) for how easy it is to add this tool to an agent.
   - **Colab notebook** to try the quick-start examples: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/langroid/langroid/blob/main/examples/Langroid_quick_start.ipynb) 
-  - **0.1.37:** Added [`SQLChatAgent`](langroid/agent/special/sql_chat_agent.py) -- thanks to our latest contributor [Rithwik Babu](https://github.com/rithwikbabu)!
-  - Multi-agent Example: [Autocorrect chat](examples/basic/autocorrect.py)
+  - **0.1.37:** Added [`SQLChatAgent`](https://github.com/langroid/langroid/blob/main/langroid/agent/special/sql_chat_agent.py) -- thanks to our latest contributor [Rithwik Babu](https://github.com/rithwikbabu)!
+  - Multi-agent Example: [Autocorrect chat](https://github.com/langroid/langroid/blob/main/examples/basic/autocorrect.py)
 - **July 2023:** 
-  - **0.1.30:** Added [`TableChatAgent`](langroid/agent/special/table_chat_agent.py) to 
-    [chat](examples/data-qa/table_chat.py) with tabular datasets (dataframes, files, URLs): LLM generates Pandas code,
+  - **0.1.30:** Added [`TableChatAgent`](https://github.com/langroid/langroid/blob/main/langroid/agent/special/table_chat_agent.py) to 
+    [chat](https://github.com/langroid/langroid/blob/main/examples/data-qa/table_chat.py) with tabular datasets (dataframes, files, URLs): LLM generates Pandas code,
     and code is executed using Langroid's tool/function-call mechanism. 
   - **Demo:** 3-agent system for Audience [Targeting](https://langroid.github.io/langroid/demos/targeting/audience-targeting/).
-  - **0.1.27**: Added [support](langroid/cachedb/momento_cachedb.py) 
+  - **0.1.27**: Added [support](https://github.com/langroid/langroid/blob/main/langroid/cachedb/momento_cachedb.py) 
     for [Momento Serverless Cache](https://www.gomomento.com/) as an alternative to Redis.
-  - **0.1.24**: [`DocChatAgent`](langroid/agent/special/doc_chat_agent.py) 
-    now [accepts](langroid/parsing/document_parser.py) PDF files or URLs.
+  - **0.1.24**: [`DocChatAgent`](https://github.com/langroid/langroid/blob/main/langroid/agent/special/doc_chat_agent.py) 
+    now [accepts](https://github.com/langroid/langroid/blob/main/langroid/parsing/document_parser.py) PDF files or URLs.
 
 </details>
 
-# :rocket: Demo
+# 🚀 Demo
 Suppose you want to extract structured information about the key terms 
 of a commercial lease document. You can easily do this with Langroid using a two-agent system,
 as we show in the [langroid-examples](https://github.com/langroid/langroid-examples/blob/main/examples/docqa/chat_multi_extract.py) repo.
@@ -428,12 +448,12 @@ format using a Function-call.
 Here is what it looks like in action 
 (a pausable mp4 video is [here](https://vimeo.com/871429249)).
 
-![Demo](docs/assets/demos/lease-extractor-demo.gif)
+![Demo](https://raw.githubusercontent.com/langroid/langroid/main/docs/assets/demos/lease-extractor-demo.gif)
 
 
-# :zap: Highlights
+# ⚡ Highlights
 (For a more up-to-date list see the 
-[Updates/Releases](https://github.com/langroid/langroid?tab=readme-ov-file#fire-updatesreleases) 
+[Updates/Releases](https://github.com/langroid/langroid?tab=readme-ov-file#-updatesreleases) 
 section above)
 - **Agents as first-class citizens:** The [Agent](https://langroid.github.io/langroid/reference/agent/base/#langroid.agent.base.Agent) class encapsulates LLM conversation state,
   and optionally a vector-store and tools. Agents are a core abstraction in Langroid;
@@ -474,7 +494,7 @@ such as [ollama](https://github.com/ollama), [oobabooga](https://github.com/ooba
 
 --- 
 
-# :gear: Installation and Setup
+# ⚙️ Installation and Setup
 
 ### Install `langroid`
 Langroid requires Python 3.11+. We recommend using a virtual environment.
@@ -510,7 +530,7 @@ For many practical scenarios, you may need additional optional dependencies:
 <summary><b>Optional Installs for using SQL Chat with a PostgreSQL DB </b></summary>
 
 If you are using `SQLChatAgent` 
-(e.g. the script [`examples/data-qa/sql-chat/sql_chat.py`](examples/data-qa/sql-chat/sql_chat.py)),
+(e.g. the script [`examples/data-qa/sql-chat/sql_chat.py`](https://github.com/langroid/langroid/blob/main/examples/data-qa/sql-chat/sql_chat.py)),
 with a postgres db, you will need to:
 
 - Install PostgreSQL dev libraries for your platform, e.g.
@@ -523,7 +543,52 @@ with a postgres db, you will need to:
   If this gives you an error, try `pip install psycopg2-binary` in your virtualenv.
 </details>
 
-:memo: If you get strange errors involving `mysqlclient`, try doing `pip uninstall mysqlclient` followed by `pip install mysqlclient`.
+📝 If you get strange errors involving `mysqlclient`, try doing `pip uninstall mysqlclient` followed by `pip install mysqlclient`.
+
+### Claude Code Plugin (Optional)
+
+This plugin provides two skills:
+
+- `langroid:patterns` - Your Claude Code agent can leverage this skill to produce
+  Langroid multi-agent code using proper design patterns.
+- `langroid:add-pattern` - The agent can use this skill to record new patterns it
+  learns, for future reference, either autonomously or when prompted by the user.
+
+**Step 1: Add the Langroid marketplace**
+
+From terminal:
+```bash
+claude plugin marketplace add langroid/langroid
+```
+
+Or within Claude Code:
+```
+/plugin marketplace add langroid/langroid
+```
+
+**Step 2: Install the Langroid plugin**
+
+From terminal:
+```bash
+claude plugin install langroid@langroid
+```
+
+Or within Claude Code:
+```
+/plugin install langroid@langroid
+```
+
+Once installed, simply ask your Claude Code agent to implement Langroid patterns in
+natural language, e.g.,
+
+> set up a Langroid agent so it uses the EditTool, and wrap it in a task that ends as soon as the tool is generated
+
+and it will automatically use the `langroid:patterns` skill to follow the right design pattern.
+
+You can also ask Claude Code to record a new pattern when you discover one, e.g.,
+
+> record this as a new Langroid pattern for setting up MCP tools
+
 
 ### Set up environment variables (API keys, etc)
 
@@ -559,8 +624,16 @@ All of the following environment variable settings are optional, and some are on
 to use specific features (as noted below).
 
 - **Qdrant** Vector Store API Key, URL. This is only required if you want to use Qdrant cloud.
-  Alternatively [Chroma](https://docs.trychroma.com/) or [LanceDB](https://lancedb.com/) are also currently supported. 
+  Alternatively [Chroma](https://docs.trychroma.com/),
+  [LanceDB](https://lancedb.com/), or [Milvus](https://milvus.io/) are also
+  currently supported.
   We use the local-storage version of Chroma, so there is no need for an API key.
+- **Milvus** Vector Store URI, token, database name. These are optional.
+  Without them, Milvus uses local storage at `./milvus.db`. Set `MILVUS_URI`
+  for Milvus server or Zilliz Cloud, `MILVUS_TOKEN` for token-based access,
+  and `MILVUS_DB_NAME` for a named database. Milvus Lite is unavailable on
+  Windows, so Windows users must set `MILVUS_URI` to a Milvus server or Zilliz
+  Cloud endpoint.
 - **Redis** Password, host, port: This is optional, and only needed to cache LLM API responses
   using Redis Cloud. Redis [offers](https://redis.com/try-free/) a free 30MB Redis account
   which is more than sufficient to try out Langroid and even beyond.
@@ -582,12 +655,12 @@ to use specific features (as noted below).
   After obtaining these credentials, store them as values of 
   `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` in your `.env` file. 
   Full documentation on using this (and other such "stateless" tools) is coming soon, but 
-  in the meantime take a peek at this [chat example](examples/basic/chat-search.py), which 
+  in the meantime take a peek at this [chat example](https://github.com/langroid/langroid/blob/main/examples/basic/chat-search.py), which 
   shows how you can easily equip an Agent with a `GoogleSearchtool`.
   
 
 
-If you add all of these optional variables, your `.env` file should look like this:
+An `.env` file with commonly used optional variables looks like this:
 ```bash
 OPENAI_API_KEY=your-key-here-without-quotes
 GITHUB_ACCESS_TOKEN=your-personal-access-token-no-quotes
@@ -621,7 +694,7 @@ provides more information, and you can set each environment variable as follows:
 
 ---
 
-# :whale: Docker Instructions
+# 🐳 Docker Instructions
 
 We provide a containerized version of the [`langroid-examples`](https://github.com/langroid/langroid-examples) 
 repository via this [Docker Image](https://hub.docker.com/r/langroid/langroid).
@@ -644,17 +717,17 @@ python examples/<Path/To/Example.py>
 
 
 
-# :tada: Usage Examples
+# 🎉 Usage Examples
 
 These are quick teasers to give a glimpse of what you can do with Langroid
 and how your code would look. 
 
-:warning: The code snippets below are intended to give a flavor of the code
+⚠️ The code snippets below are intended to give a flavor of the code
 and they are **not** complete runnable examples! For that we encourage you to 
 consult the [`langroid-examples`](https://github.com/langroid/langroid-examples) 
 repository.
 
-:information_source:
+ℹ️
 The various LLM prompts and instructions in Langroid
 have been tested to work well with GPT-4 (and to some extent GPT-4o).
 Switching to other LLMs (local/open and proprietary) is easy (see guides mentioned above),
@@ -662,7 +735,7 @@ and may suffice for some applications, but in general you may see inferior resul
 unless you adjust the prompts and/or the multi-agent setup.
 
 
-:book: Also see the
+📖 Also see the
 [`Getting Started Guide`](https://langroid.github.io/langroid/quick-start/)
 for a detailed tutorial.
 
@@ -947,7 +1020,7 @@ folder of the `langroid-examples` repo.
 </details>
 
 <details>
-<summary><b> :fire: Chat with tabular data (file paths, URLs, dataframes) </b></summary>
+<summary><b> 🔥 Chat with tabular data (file paths, URLs, dataframes) </b></summary>
 
 Using Langroid you can set up a `TableChatAgent` with a dataset (file path, URL or dataframe),
 and query it. The Agent's LLM generates Pandas code to answer the query, 
@@ -1003,7 +1076,7 @@ script in the `langroid-examples` repo.
 
 ---
 
-# :heart: Thank you to our [supporters](https://github.com/langroid/langroid/stargazers)
+# ❤️ Thank you to our [supporters](https://github.com/langroid/langroid/stargazers)
 
 If you like this project, please give it a star ⭐ and 📢 spread the word in your network or social media:
 

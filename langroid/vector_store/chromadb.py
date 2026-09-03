@@ -2,6 +2,8 @@ import json
 import logging
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
+from pydantic_settings import SettingsConfigDict
+
 from langroid.embedding_models.base import (
     EmbeddingModelsConfig,
 )
@@ -16,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class ChromaDBConfig(VectorStoreConfig):
+    model_config = SettingsConfigDict(env_prefix="CHROMA_")
+
     collection_name: str = "temp"
     storage_path: str = ".chroma/data"
     distance: Literal["cosine", "l2", "ip"] = "cosine"
@@ -28,7 +32,8 @@ class ChromaDBConfig(VectorStoreConfig):
 
 
 class ChromaDB(VectorStore):
-    def __init__(self, config: ChromaDBConfig = ChromaDBConfig()):
+    def __init__(self, config: ChromaDBConfig | None = None):
+        config = config if config is not None else ChromaDBConfig()
         super().__init__(config)
         try:
             import chromadb
